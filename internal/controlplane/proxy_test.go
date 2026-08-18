@@ -218,6 +218,26 @@ func TestAPIHandlerRoutesSharedGatewayKeyByRequestedModel(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), tokenRouterModel) || !strings.Contains(response.Body.String(), openCodeModel) {
 		t.Fatalf("models response = %d %s", response.Code, response.Body.String())
 	}
+	var modelList struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &modelList); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range modelList.Data {
+		if model["id"] != openCodeModel {
+			continue
+		}
+		if model["supportsReasoningEffort"] != true || model["reasoningEffort"] != "none" || model["contextWindow"] != float64(1000000) {
+			t.Fatalf("OpenCode model metadata = %#v", model)
+		}
+		efforts, ok := model["reasoningEfforts"].([]any)
+		if !ok || len(efforts) != 4 {
+			t.Fatalf("OpenCode reasoning efforts = %#v", model["reasoningEfforts"])
+		}
+		return
+	}
+	t.Fatalf("OpenCode model metadata missing: %#v", modelList.Data)
 }
 
 func TestDefaultLoginRequiresPasswordChange(t *testing.T) {

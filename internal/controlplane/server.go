@@ -379,12 +379,25 @@ func (s *Server) models(w http.ResponseWriter, instances []Instance) {
 	for _, instance := range instances {
 		providers[providerOrDefault(instance.Provider)] = true
 	}
-	models := make([]map[string]string, 0, 2)
+	models := make([]map[string]any, 0, 2)
 	if providers[ProviderTokenRouter] {
-		models = append(models, map[string]string{"id": tokenRouterModel, "object": "model", "owned_by": "tokenrouter"})
+		models = append(models, map[string]any{"id": tokenRouterModel, "object": "model", "owned_by": "tokenrouter"})
 	}
 	if providers[ProviderOpenCode] {
-		models = append(models, map[string]string{"id": openCodeModel, "object": "model", "owned_by": "opencode"})
+		models = append(models, map[string]any{
+			"id":                      openCodeModel,
+			"object":                  "model",
+			"owned_by":                "opencode",
+			"contextWindow":           1000000,
+			"supportsReasoningEffort": true,
+			"reasoningEffort":         "none",
+			"reasoningEfforts": []map[string]any{
+				{"value": "none", "label": "None", "default": true},
+				{"value": "low", "label": "Low"},
+				{"value": "medium", "label": "Medium"},
+				{"value": "high", "label": "High"},
+			},
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
 }

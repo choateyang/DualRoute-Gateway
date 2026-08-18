@@ -71,6 +71,8 @@ curl --no-buffer http://127.0.0.1:13337/v1/chat/completions \
 
 `GET /v1/models` 返回当前已部署实例可用的模型。Responses API 也根据请求体中的 `model` 选择上游。
 
+OpenCode 的 `deepseek-v4-flash-free` 模型列表条目额外声明 `contextWindow: 1000000`、`supportsReasoningEffort`、`reasoningEffort` 和 `reasoningEfforts`，兼容 DSH 等客户端的推理等级选择器；默认值仍为 `none`。
+
 客户端 Key 只用于访问网关；每个实例保存的上游 API Key 才用于访问上游。网关固定设置上游鉴权：
 
 ```text
