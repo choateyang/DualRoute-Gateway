@@ -33,7 +33,7 @@ func TestCreateUsesFixedImageNetworkAndManagedLabel(t *testing.T) {
 	docker := &dockerClient{client: server.Client(), base: server.URL}
 	cfg := Config{GatewayImage: "fixed/gateway:test", DockerNetwork: "gateway-network", InstanceToken: "internal"}
 	instance := Instance{Name: "gateway-b", ProxyURLs: []string{"http://proxy:18081"}, MaxConcurrency: 4, QueueSize: 8}
-	if err := docker.create(cfg, instance, []string{"gw_test"}, "zen-secret-key"); err != nil {
+	if err := docker.create(cfg, instance, []string{"gw_test"}, "upstream-secret-key"); err != nil {
 		t.Fatal(err)
 	}
 	if payload["Image"] != cfg.GatewayImage {
@@ -46,8 +46,8 @@ func TestCreateUsesFixedImageNetworkAndManagedLabel(t *testing.T) {
 	if _, exists := labels["dualroute.gateway.upstream_url"]; exists {
 		t.Fatalf("upstream URL must not be configurable through labels: %v", labels)
 	}
-	if strings.Contains(fmt.Sprint(labels), "zen-secret-key") {
-		t.Fatalf("Docker labels leaked Zen API key: %v", labels)
+	if strings.Contains(fmt.Sprint(labels), "upstream-secret-key") {
+		t.Fatalf("Docker labels leaked upstream API key: %v", labels)
 	}
 	host := payload["HostConfig"].(map[string]any)
 	if host["NetworkMode"] != cfg.DockerNetwork {
@@ -58,7 +58,7 @@ func TestCreateUsesFixedImageNetworkAndManagedLabel(t *testing.T) {
 		t.Fatalf("binds = %v", binds)
 	}
 	environment := fmt.Sprint(payload["Env"])
-	if !strings.Contains(environment, "MAX_RETRIES=0") || !strings.Contains(environment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(environment, "UPSTREAM_API_KEY=zen-secret-key") {
+	if !strings.Contains(environment, "MAX_RETRIES=0") || !strings.Contains(environment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(environment, "UPSTREAM_API_KEY=upstream-secret-key") {
 		t.Fatalf("environment = %s", environment)
 	}
 }
@@ -79,7 +79,7 @@ func TestCreateUsesProviderSpecificUpstreamConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	environment := fmt.Sprint(payload["Env"])
-	if !strings.Contains(environment, "UPSTREAM_PROVIDER=opencode") || !strings.Contains(environment, "UPSTREAM_URL="+openCodeUpstreamURL) || !strings.Contains(environment, "UPSTREAM_MODEL="+openCodeModel) {
+	if !strings.Contains(environment, "UPSTREAM_PROVIDER=opencode") || !strings.Contains(environment, "UPSTREAM_URL="+openCodeAPIURL) || !strings.Contains(environment, "UPSTREAM_MODEL="+openCodeModel) {
 		t.Fatalf("environment = %s", environment)
 	}
 	labels := payload["Labels"].(map[string]any)
@@ -192,7 +192,7 @@ func TestInstanceCreateRemovesUnhealthyContainer(t *testing.T) {
 	defer server.Close()
 	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), GatewayImage: "gateway:test", DockerNetwork: "gateway-network", MaxInstances: 16})
 	s.docker = &dockerClient{client: server.Client(), base: server.URL, probe: func(string) error { return errors.New("unhealthy") }}
-	req := httptest.NewRequest(http.MethodPost, "/api/instances", strings.NewReader(`{"name":"gateway-b","zen_api_key":"zen-secret-key","max_concurrency":4,"queue_size":8}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/instances", strings.NewReader(`{"name":"gateway-b","upstream_api_key":"upstream-secret-key","max_concurrency":4,"queue_size":8}`))
 	res := httptest.NewRecorder()
 	s.instanceCreate(res, req)
 	if res.Code != http.StatusBadGateway || !strings.Contains(res.Body.String(), "health_check_failed") {
@@ -259,7 +259,7 @@ func TestExecReturnsNonZeroExitCode(t *testing.T) {
 }
 
 func TestValidateInstanceRequestAcceptsSOCKS5(t *testing.T) {
-	request := instanceRequest{Name: "gateway-b", ZenAPIKey: "zen-secret-key", ProxyURLs: []string{"socks5h://mihomo:10801"}, MaxConcurrency: 4, QueueSize: 8}
+	request := instanceRequest{Name: "gateway-b", UpstreamAPIKey: "upstream-secret-key", ProxyURLs: []string{"socks5h://mihomo:10801"}, MaxConcurrency: 4, QueueSize: 8}
 	if code, message := validateInstanceRequest(&request, false); code != 0 {
 		t.Fatalf("validation failed: %d %s", code, message)
 	}
@@ -270,29 +270,29 @@ func TestValidateInstanceRequestRequiresUpstreamAPIKeyOnCreate(t *testing.T) {
 	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
 		t.Fatalf("missing upstream API key status = %d", code)
 	}
-	request = instanceRequest{ZenAuthMode: "custom", MaxConcurrency: 4, QueueSize: 8}
+	request = instanceRequest{AuthMode: "custom", MaxConcurrency: 4, QueueSize: 8}
 	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
-		t.Fatalf("missing custom Zen API key status = %d", code)
+		t.Fatalf("missing custom upstream API key status = %d", code)
 	}
-	request.ZenAPIKey = "key\nwith-newline"
+	request.UpstreamAPIKey = "key\nwith-newline"
 	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
-		t.Fatalf("invalid Zen API key status = %d", code)
+		t.Fatalf("invalid upstream API key status = %d", code)
 	}
-	request.ZenAPIKey = "zen-secret-key"
+	request.UpstreamAPIKey = "upstream-secret-key"
 	if code, message := validateInstanceRequest(&request, true); code != 0 {
-		t.Fatalf("valid Zen API key rejected: %d %s", code, message)
+		t.Fatalf("valid upstream API key rejected: %d %s", code, message)
 	}
 }
 
 func TestValidateInstanceRequestRejectsPublicKeyMode(t *testing.T) {
-	request := instanceRequest{ZenAuthMode: "public", MaxConcurrency: 4, QueueSize: 8}
+	request := instanceRequest{AuthMode: "public", MaxConcurrency: 4, QueueSize: 8}
 	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
 		t.Fatalf("public mode accepted: %d", code)
 	}
 }
 
 func TestValidateInstanceRequestRejectsPublicKeyInCustomMode(t *testing.T) {
-	request := instanceRequest{ZenAuthMode: "custom", ZenAPIKey: "public", MaxConcurrency: 4, QueueSize: 8}
+	request := instanceRequest{AuthMode: "custom", UpstreamAPIKey: "public", MaxConcurrency: 4, QueueSize: 8}
 	if code, _ := validateInstanceRequest(&request, true); code != http.StatusBadRequest {
 		t.Fatalf("public key accepted in custom mode: %d", code)
 	}
@@ -349,7 +349,7 @@ func TestCreateWithSpecPreservesComposeMetadataAndMounts(t *testing.T) {
 	original.HostConfig.ReadonlyRootfs = true
 	original.HostConfig.RestartPolicy = map[string]any{"Name": "unless-stopped"}
 	instance := Instance{Name: "gateway-a", ProxyURLs: []string{"socks5h://mihomo:10801"}, MaxConcurrency: 6, QueueSize: 12}
-	if err := docker.createWithSpec(Config{InstanceToken: "internal"}, instance, []string{"gw_test"}, "zen-secret-key", original); err != nil {
+	if err := docker.createWithSpec(Config{InstanceToken: "internal"}, instance, []string{"gw_test"}, "upstream-secret-key", original); err != nil {
 		t.Fatal(err)
 	}
 	if payload["Image"] != "gateway:test" {
@@ -357,7 +357,7 @@ func TestCreateWithSpecPreservesComposeMetadataAndMounts(t *testing.T) {
 	}
 	environment := payload["Env"].([]any)
 	joinedEnvironment := fmt.Sprint(environment)
-	if !strings.Contains(joinedEnvironment, "REQUEST_TIMEOUT=9m") || !strings.Contains(joinedEnvironment, "MAX_CONCURRENCY=6") || !strings.Contains(joinedEnvironment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(joinedEnvironment, "UPSTREAM_API_KEY=zen-secret-key") {
+	if !strings.Contains(joinedEnvironment, "REQUEST_TIMEOUT=9m") || !strings.Contains(joinedEnvironment, "MAX_CONCURRENCY=6") || !strings.Contains(joinedEnvironment, "UPSTREAM_URL="+defaultUpstreamURL) || !strings.Contains(joinedEnvironment, "UPSTREAM_API_KEY=upstream-secret-key") {
 		t.Fatalf("environment = %v", environment)
 	}
 	labels := payload["Labels"].(map[string]any)
@@ -367,8 +367,8 @@ func TestCreateWithSpecPreservesComposeMetadataAndMounts(t *testing.T) {
 	if _, exists := labels["dualroute.gateway.upstream_url"]; exists {
 		t.Fatalf("upstream URL label was retained: %v", labels)
 	}
-	if strings.Contains(fmt.Sprint(labels), "zen-secret-key") {
-		t.Fatalf("Docker labels leaked Zen API key: %v", labels)
+	if strings.Contains(fmt.Sprint(labels), "upstream-secret-key") {
+		t.Fatalf("Docker labels leaked upstream API key: %v", labels)
 	}
 	host := payload["HostConfig"].(map[string]any)
 	binds := host["Binds"].([]any)
@@ -668,7 +668,7 @@ func TestReplaceKeepsOldContainerWhenReplacementIsUnhealthy(t *testing.T) {
 
 	docker := &dockerClient{client: server.Client(), base: server.URL, probe: func(string) error { return errors.New("unhealthy") }}
 	instance := Instance{Name: "gateway-a", MaxConcurrency: 4, QueueSize: 8}
-	if err := docker.replace(Config{InstanceToken: "internal"}, instance, []string{"gw_test"}, "zen-secret-key"); err == nil {
+	if err := docker.replace(Config{InstanceToken: "internal"}, instance, []string{"gw_test"}, "upstream-secret-key"); err == nil {
 		t.Fatal("expected unhealthy replacement error")
 	}
 	if oldRenamed {

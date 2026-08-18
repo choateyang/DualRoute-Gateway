@@ -52,6 +52,7 @@ type Config struct {
 	FreeModelsOnly           bool
 	DisableThinkingByDefault bool
 	MinThinkingMaxTokens     int
+	IsolateUpstreamState     bool
 	AdminToken               string
 	InstanceAdminToken       string
 	DataDir                  string
@@ -65,7 +66,7 @@ func DefaultConfig() Config {
 		CooldownMax: 60 * time.Second, ProxyRefresh: 30 * time.Second,
 		ProxyProbeURLs: []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://www.cloudflare.com/cdn-cgi/trace"}, ProxyProbeWait: 10 * time.Second,
 		ProxyProbeJobs: 8, DirectEnabled: true,
-		FreeModelsOnly: false, DisableThinkingByDefault: false, MinThinkingMaxTokens: 0,
+		FreeModelsOnly: false, DisableThinkingByDefault: false, MinThinkingMaxTokens: 0, IsolateUpstreamState: true,
 		DataDir: "/data",
 	}
 }
@@ -182,6 +183,13 @@ func LoadConfig() (Config, error) {
 	}
 	if v := os.Getenv("MIN_THINKING_MAX_TOKENS"); v != "" {
 		c.MinThinkingMaxTokens = nonNegativeInt(v, c.MinThinkingMaxTokens)
+	}
+	if v := os.Getenv("ISOLATE_UPSTREAM_STATE"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return c, fmt.Errorf("ISOLATE_UPSTREAM_STATE: %w", err)
+		}
+		c.IsolateUpstreamState = b
 	}
 	c.AdminToken = os.Getenv("ADMIN_TOKEN")
 	c.InstanceAdminToken = os.Getenv("INSTANCE_ADMIN_TOKEN")

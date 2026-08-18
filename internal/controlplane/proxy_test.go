@@ -54,6 +54,59 @@ func TestAPIHandlerProxiesPathQueryHeadersAndResponse(t *testing.T) {
 	}
 }
 
+func TestAPIHandlerCoolsRateLimitedInstanceAndUsesNextKey(t *testing.T) {
+	var limitedCalls, healthyCalls atomic.Int32
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		limitedCalls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer limited.Close()
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		healthyCalls.Add(1)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer healthy.Close()
+
+	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
+	s.instances = []Instance{
+		{Name: "gateway-key-1", URL: limited.URL, Status: "running", Provider: ProviderTokenRouter},
+		{Name: "gateway-key-2", URL: healthy.URL, Status: "running", Provider: ProviderTokenRouter},
+	}
+	request := func() *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek/deepseek-v4-pro-0813-free"}`))
+		req.Header.Set("Authorization", "Bearer gateway-key")
+		s.APIHandler().ServeHTTP(response, req)
+		return response
+	}
+	if response := request(); response.Code != http.StatusTooManyRequests {
+		t.Fatalf("first status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := request(); response.Code != http.StatusOK || response.Body.String() != `{"ok":true}` {
+		t.Fatalf("second status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if limitedCalls.Load() != 1 || healthyCalls.Load() != 1 {
+		t.Fatalf("limited=%d healthy=%d", limitedCalls.Load(), healthyCalls.Load())
+	}
+}
+
+func TestRequestedProviderRejectsOversizedBodyWithoutTruncating(t *testing.T) {
+	payload := `{"model":"` + tokenRouterModel + `","input":"` + strings.Repeat("x", maxAPIRequestBodyBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(payload))
+	_, _, err := requestedProvider(req)
+	if err != errAPIRequestBodyTooLarge {
+		t.Fatalf("err = %v, want %v", err, errAPIRequestBodyTooLarge)
+	}
+}
+
 func TestAPIHandlerUsesProxyTrafficPool(t *testing.T) {
 	directCalls, proxyCalls := 0, 0
 	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,11 +163,11 @@ func TestAPIHandlerRejectsUnknownKey(t *testing.T) {
 	}
 }
 
-func TestAPIHandlerRejectsZenKeyAsClientCredential(t *testing.T) {
+func TestAPIHandlerRejectsUpstreamKeyAsClientCredential(t *testing.T) {
 	s := New(Config{InstanceToken: "internal", DataDir: t.TempDir(), BootstrapKeys: []string{"gateway-key"}})
-	s.zenKeys["gateway-a"] = "zen-secret-key"
+	s.upstreamKeys["gateway-a"] = "upstream-secret-key"
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	request.Header.Set("Authorization", "Bearer zen-secret-key")
+	request.Header.Set("Authorization", "Bearer upstream-secret-key")
 	response := httptest.NewRecorder()
 	s.APIHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
@@ -191,24 +244,24 @@ func TestDefaultLoginRequiresPasswordChange(t *testing.T) {
 	}
 }
 
-func TestZenKeysPersistReloadAndMask(t *testing.T) {
+func TestUpstreamKeysPersistReloadAndMask(t *testing.T) {
 	dataDir := t.TempDir()
 	s := New(Config{InstanceToken: "internal", DataDir: dataDir})
-	s.zenKeys["gateway-a"] = "zen-instance-secret-key"
-	s.persistZenKeysLocked()
+	s.upstreamKeys["gateway-a"] = "upstream-instance-secret-key"
+	s.persistUpstreamKeysLocked()
 
 	reloaded := New(Config{InstanceToken: "internal", DataDir: dataDir})
-	if reloaded.zenKeys["gateway-a"] != "zen-instance-secret-key" {
-		t.Fatalf("reloaded keys = %#v", reloaded.zenKeys)
+	if reloaded.upstreamKeys["gateway-a"] != "upstream-instance-secret-key" {
+		t.Fatalf("reloaded keys = %#v", reloaded.upstreamKeys)
 	}
-	if got := maskAPIKey(reloaded.zenKeys["gateway-a"]); got != "zen-***************-key" {
+	if got := maskAPIKey(reloaded.upstreamKeys["gateway-a"]); !strings.HasPrefix(got, "upst") || !strings.HasSuffix(got, "-key") || strings.Contains(got, "upstream-instance-secret-key") {
 		t.Fatalf("masked key = %q", got)
 	}
-	data, err := json.Marshal(Summary{ZenKeyMasked: maskAPIKey(reloaded.zenKeys["gateway-a"]), ZenKeySet: true})
+	data, err := json.Marshal(Summary{UpstreamKeyMasked: maskAPIKey(reloaded.upstreamKeys["gateway-a"]), UpstreamKeySet: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "zen-instance-secret-key") {
+	if strings.Contains(string(data), "upstream-instance-secret-key") {
 		t.Fatalf("summary leaked key: %s", data)
 	}
 }

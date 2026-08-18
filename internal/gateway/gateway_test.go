@@ -74,6 +74,48 @@ func TestForwardReplacesClientAuthorizationWithUpstreamKey(t *testing.T) {
 	}
 }
 
+func TestGatewayAcceptsCredentialVariantsAndSetsAnthropicUpstreamKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "tokenrouter-test-key" {
+			t.Errorf("x-api-key = %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	g, err := New(testConfig(upstream.URL), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(`{"model":"model-a","messages":[]}`))
+	req.Header.Set("X-API-Key", "test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestGatewayAcceptsLowercaseBearerScheme(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	g, err := New(testConfig(upstream.URL), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestUpstreamTargetURLAvoidsDuplicateVersionPrefix(t *testing.T) {
 	tests := []struct {
 		baseURL string
@@ -195,7 +237,7 @@ func TestForwardRetriesOnlyDistinctEgressAndPreservesModel(t *testing.T) {
 			t.Errorf("body = %q", body)
 		}
 		if calls.Add(1) < 3 {
-			w.WriteHeader(http.StatusTooManyRequests)
+			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		_, _ = io.WriteString(w, `{"ok":true}`)
@@ -328,6 +370,77 @@ func TestNormalizeResponsesPassesLegacyMessagesThrough(t *testing.T) {
 	body := g.normalizeRequestBody("/v1/responses", []byte(`{"model":"model-a","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi","id":"msg_client"}]}`))
 	if got := string(body); got != `{"model":"model-a","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi","id":"msg_client"}]}` {
 		t.Fatalf("legacy messages were changed: %s", got)
+	}
+}
+
+func TestNormalizeResponsesConvertsNativeFunctionTools(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
+	g.cfg.FreeModelsOnly = false
+	g.cfg.DisableThinkingByDefault = false
+	g.cfg.MinThinkingMaxTokens = 0
+	body, err := g.normalizeRequestBodyChecked("/v1/responses", []byte(`{
+		"model":"model-a",
+		"input":"hello",
+		"tools":[{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{}},"strict":true}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools, ok := payload["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %#v", payload["tools"])
+	}
+	tool := tools[0].(map[string]any)
+	function, ok := tool["function"].(map[string]any)
+	if !ok || function["name"] != "get_weather" {
+		t.Fatalf("function = %#v", tool["function"])
+	}
+	if _, exists := tool["name"]; exists {
+		t.Fatalf("native name was not moved: %#v", tool)
+	}
+}
+
+func TestNormalizeResponsesRejectsFunctionToolWithoutName(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
+	g.cfg.FreeModelsOnly = false
+	g.cfg.DisableThinkingByDefault = false
+	g.cfg.MinThinkingMaxTokens = 0
+	_, err := g.normalizeRequestBodyChecked("/v1/responses", []byte(`{"model":"model-a","input":"hello","tools":[{"type":"function","parameters":{"type":"object"}}]}`))
+	if err == nil || !strings.Contains(err.Error(), "tool 0 name is required") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestNormalizeResponsesConvertsFunctionToolChoice(t *testing.T) {
+	g := &Gateway{cfg: DefaultConfig()}
+	g.cfg.ForcedModel = ""
+	g.cfg.FreeModelsOnly = false
+	g.cfg.DisableThinkingByDefault = false
+	g.cfg.MinThinkingMaxTokens = 0
+	body, err := g.normalizeRequestBodyChecked("/v1/responses", []byte(`{"model":"model-a","input":"hello","tool_choice":{"type":"function","name":"get_weather"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	choice, ok := payload["tool_choice"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_choice = %#v", payload["tool_choice"])
+	}
+	function, ok := choice["function"].(map[string]any)
+	if !ok || function["name"] != "get_weather" {
+		t.Fatalf("function = %#v", choice["function"])
+	}
+	if _, exists := choice["name"]; exists {
+		t.Fatalf("native tool_choice name was not moved: %#v", choice)
 	}
 }
 
@@ -579,18 +692,16 @@ func TestModelCooldownDoesNotBlockOtherModelsOnSameEgress(t *testing.T) {
 	}
 }
 
-func TestModel429FailsOverOnceToDistinctEgress(t *testing.T) {
+func TestModel429CoolsAllEgresses(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		_, _ = io.WriteString(w, `{"ok":true}`)
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer upstream.Close()
 	c := testConfig(upstream.URL)
-	c.MaxRetries = 1
+	c.MaxRetries = 2
+	c.CooldownMax = time.Minute
 	g, err := New(c, slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -603,27 +714,22 @@ func TestModel429FailsOverOnceToDistinctEgress(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer test-key")
 	res := httptest.NewRecorder()
 	g.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusOK || calls.Load() != 2 {
+	if res.Code != http.StatusTooManyRequests || calls.Load() != 1 {
 		t.Fatalf("status = %d, calls = %d, body = %s", res.Code, calls.Load(), res.Body.String())
 	}
-	g.auditMu.RLock()
-	defer g.auditMu.RUnlock()
-	if len(g.audits) != 2 || g.audits[0].Status != http.StatusTooManyRequests || g.audits[1].Status != http.StatusOK {
-		t.Fatalf("audits = %#v", g.audits)
-	}
-	if g.audits[0].Model != "model-a" || g.audits[1].Model != "model-a" {
-		t.Fatalf("audit models = %q, %q", g.audits[0].Model, g.audits[1].Model)
+	for index, slot := range g.slots {
+		_, ready := slot.readiness("model-a", time.Now())
+		if !ready.After(time.Now().Add(30 * time.Second)) {
+			t.Fatalf("slot %d was not cooled: ready=%s", index, ready)
+		}
 	}
 }
 
-func Test429FailoverKeepsTheNewActiveSlotForFollowingRequests(t *testing.T) {
+func Test429DoesNotChangeActiveEgress(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		_, _ = io.WriteString(w, `{"ok":true}`)
+		calls.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer upstream.Close()
 	c := testConfig(upstream.URL)
@@ -643,17 +749,48 @@ func Test429FailoverKeepsTheNewActiveSlotForFollowingRequests(t *testing.T) {
 		g.Handler().ServeHTTP(res, req)
 		return res
 	}
-	if res := request(); res.Code != http.StatusOK {
+	if res := request(); res.Code != http.StatusTooManyRequests {
 		t.Fatalf("first status = %d, body = %s", res.Code, res.Body.String())
 	}
-	if got := g.active.Load(); got != 1 {
-		t.Fatalf("active after 429 failover = %d, want 1", got)
+	if got := g.active.Load(); got != 0 {
+		t.Fatalf("active changed after 429 = %d, want 0", got)
 	}
-	if res := request(); res.Code != http.StatusOK {
-		t.Fatalf("following status = %d, body = %s", res.Code, res.Body.String())
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestOpenCode429RetriesNextEgress(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+	c := testConfig(upstream.URL)
+	c.UpstreamProvider = ProviderOpenCode
+	c.MaxRetries = 1
+	g, err := New(c, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.slots = []*proxySlot{
+		{client: g.client, url: "socks5h://proxy:10801", egress: "192.0.2.1"},
+		{client: g.client, url: "socks5h://proxy:10802", egress: "192.0.2.2"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"model-a","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	res := httptest.NewRecorder()
+	g.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || calls.Load() != 2 {
+		t.Fatalf("status = %d, calls = %d, body = %s", res.Code, calls.Load(), res.Body.String())
 	}
 	if got := g.active.Load(); got != 1 {
-		t.Fatalf("active changed during ordinary request = %d, want 1", got)
+		t.Fatalf("active egress index = %d, want 1", got)
 	}
 }
 
@@ -1002,6 +1139,10 @@ func TestTokenUsageParsesRegularAndStreamingResponses(t *testing.T) {
 	responses := parseTokenUsage([]byte(`{"response":{"usage":{"input_tokens":15,"output_tokens":9,"total_tokens":24,"input_tokens_details":{"cached_tokens":6}}}}`))
 	if responses != (tokenUsage{PromptTokens: 15, CompletionTokens: 9, TotalTokens: 24, CachedTokens: 6}) {
 		t.Fatalf("responses usage = %#v", responses)
+	}
+	pro := parseTokenUsage([]byte(`{"usage":{"prompt_cache_hit_tokens":11,"prompt_cache_miss_tokens":5,"completion_tokens":9,"total_tokens":25}}`))
+	if pro != (tokenUsage{PromptTokens: 16, CompletionTokens: 9, TotalTokens: 25, CachedTokens: 11}) {
+		t.Fatalf("pro usage = %#v", pro)
 	}
 	if model := requestModel([]byte(`{"model":"deepseek-v4-flash-free","input":"hello"}`)); model != "deepseek-v4-flash-free" {
 		t.Fatalf("responses model = %q", model)

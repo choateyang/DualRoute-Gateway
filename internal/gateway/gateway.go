@@ -1036,7 +1036,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
-	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, auditMetadata{ClientKey: maskGatewayKey(requestBearer(r))}))
+	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, auditMetadata{ClientKey: maskGatewayKey(requestCredential(r))}))
 	if allowed, allow := methodAllowed(r.URL.Path, r.Method); !allowed {
 		w.Header().Set("Allow", allow)
 		w.Header().Set("Content-Type", "application/json")
@@ -1095,11 +1095,11 @@ func methodAllowed(path, method string) (bool, string) {
 }
 
 func constantTimeBearer(r *http.Request, expected string) bool {
-	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	got := requestBearer(r)
 	return len(got) == len(expected) && subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 func (g *Gateway) authorized(r *http.Request) bool {
-	got := requestBearer(r)
+	got := requestCredential(r)
 	g.keyMu.RLock()
 	defer g.keyMu.RUnlock()
 	for key := range g.keys {
@@ -1111,7 +1111,18 @@ func (g *Gateway) authorized(r *http.Request) bool {
 }
 
 func requestBearer(r *http.Request) string {
-	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(header) < 7 || !strings.EqualFold(header[:7], "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(header[7:])
+}
+
+func requestCredential(r *http.Request) string {
+	if bearer := requestBearer(r); bearer != "" {
+		return bearer
+	}
+	return strings.TrimSpace(r.Header.Get("X-API-Key"))
 }
 
 func maskGatewayKey(key string) string {
@@ -1136,6 +1147,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return nil
 	}
 	path := r.URL.Path
+	anthropicRequest := strings.HasPrefix(path, "/anthropic/")
 	for _, prefix := range []string{"/openai", "/anthropic", "/codex"} {
 		path = strings.TrimPrefix(path, prefix)
 	}
@@ -1197,6 +1209,10 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 				req.Header.Del(header)
 			}
 		}
+		if anthropicRequest {
+			// Use the configured upstream credential, never the client's gateway key.
+			req.Header.Set("X-API-Key", g.cfg.UpstreamAPIKey)
+		}
 		req.Header.Del("Host")
 		req.Host = ""
 		started := time.Now()
@@ -1210,15 +1226,35 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 			http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
 			return nil
 		}
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfterHeader := resp.Header.Get("Retry-After")
 			retryAfter := parseRetryAfter(retryAfterHeader)
-			if resp.StatusCode == 429 {
-				g.stats.Upstream429.Add(1)
-				slot.cooldownModel(model, g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
-			} else {
-				slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
+			if retryAfterHeader == "" && g.cfg.CooldownMax > 0 {
+				retryAfterHeader = strconv.Itoa(max(1, int(g.cfg.CooldownMax/time.Second)))
+				resp.Header.Set("Retry-After", retryAfterHeader)
 			}
+			g.stats.Upstream429.Add(1)
+			if g.cfg.UpstreamProvider == ProviderOpenCode {
+				// OpenCode public/free limits can be tied to the current egress.
+				// Cool only this slot so the next retry can use another IP.
+				slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
+				slot.cooldownModel(model, g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
+				g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, retryAfterHeader)
+				if attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) {
+					resp.Body.Close()
+					continue
+				}
+			} else {
+				// TokenRouter limits are account-scoped. Cooling every slot keeps
+				// this instance from retrying the same account and lets the control
+				// plane select another instance/key.
+				g.cooldownModelAllSlots(model, retryAfter)
+				g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, retryAfterHeader)
+			}
+		} else if resp.StatusCode >= 500 {
+			retryAfterHeader := resp.Header.Get("Retry-After")
+			retryAfter := parseRetryAfter(retryAfterHeader)
+			slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
 			g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, retryAfterHeader)
 			if attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) {
 				resp.Body.Close()
@@ -1253,6 +1289,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 				return fmt.Errorf("upstream response body: %w", readErr)
 			}
 			copyResponseHeaders(w.Header(), resp.Header)
+			setNoStoreResponseHeaders(w.Header())
 			w.WriteHeader(resp.StatusCode)
 			if _, writeErr := w.Write(data); writeErr != nil {
 				return fmt.Errorf("client response write: %w", writeErr)
@@ -1265,6 +1302,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 			return nil
 		}
 		copyResponseHeaders(w.Header(), resp.Header)
+		setNoStoreResponseHeaders(w.Header())
 		delayStreamCommit := streaming && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 		if delayStreamCommit {
 			w.Header().Del("Content-Length")
@@ -1347,6 +1385,27 @@ func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte,
 			changed = true
 		}
 	}
+	if g.cfg.UpstreamProvider == ProviderTokenRouter && g.cfg.IsolateUpstreamState {
+		if isolateTokenRouterState(payload) {
+			changed = true
+		}
+	}
+	if path == "/v1/responses" {
+		converted, err := normalizeResponsesTools(payload)
+		if err != nil {
+			return body, err
+		}
+		if converted {
+			changed = true
+		}
+		converted, err = normalizeResponsesToolChoice(payload)
+		if err != nil {
+			return body, err
+		}
+		if converted {
+			changed = true
+		}
+	}
 	if g.cfg.FreeModelsOnly && model != "" && model != "big-pickle" && !strings.HasSuffix(model, "-free") {
 		model += "-free"
 		payload["model"] = model
@@ -1379,8 +1438,141 @@ func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte,
 	return encoded, nil
 }
 
+// TokenRouter is used as a stateless upstream by this gateway. Its optional
+// session fields can bind a request to provider-side worker/KV state, so they
+// are removed unless stateful forwarding is explicitly enabled.
+func isolateTokenRouterState(payload map[string]any) bool {
+	changed := false
+	for _, key := range []string{"session_id", "previous_response_id", "conversation_id"} {
+		if _, exists := payload[key]; exists {
+			delete(payload, key)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func setNoStoreResponseHeaders(header http.Header) {
+	header.Set("Cache-Control", "no-store, private")
+	header.Set("Pragma", "no-cache")
+}
+
 func supportsReasoningControls(path string) bool {
 	return path == "/v1/chat/completions" || path == "/v1/responses"
+}
+
+// Responses clients define function tools with name/description/parameters at
+// the tool's top level. TokenRouter's OpenAI-compatible decoder expects the
+// Chat Completions shape, where those fields live under function. Normalize
+// both forms so native Responses clients can use the gateway.
+func normalizeResponsesTools(payload map[string]any) (bool, error) {
+	rawTools, exists := payload["tools"]
+	if !exists {
+		return false, nil
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		return false, fmt.Errorf("responses tools must be an array")
+	}
+	changed := false
+	for index, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			return false, fmt.Errorf("responses tool %d must be an object", index)
+		}
+		typeName, _ := tool["type"].(string)
+		if typeName != "function" {
+			continue
+		}
+
+		if rawFunction, hasFunction := tool["function"]; hasFunction {
+			function, ok := rawFunction.(map[string]any)
+			if !ok {
+				return false, fmt.Errorf("responses tool %d function must be an object", index)
+			}
+			name, _ := function["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				if topName, ok := tool["name"].(string); ok && strings.TrimSpace(topName) != "" {
+					function["name"] = topName
+					changed = true
+				} else {
+					return false, fmt.Errorf("responses tool %d function.name is required", index)
+				}
+			}
+			for _, field := range []string{"description", "parameters", "strict"} {
+				if value, exists := tool[field]; exists {
+					if _, nestedExists := function[field]; !nestedExists {
+						function[field] = value
+					}
+					delete(tool, field)
+					changed = true
+				}
+			}
+			if _, exists := tool["name"]; exists {
+				delete(tool, "name")
+				changed = true
+			}
+			continue
+		}
+
+		name, _ := tool["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			return false, fmt.Errorf("responses tool %d name is required", index)
+		}
+		function := map[string]any{"name": name}
+		for _, field := range []string{"description", "parameters", "strict"} {
+			if value, exists := tool[field]; exists {
+				function[field] = value
+				delete(tool, field)
+			}
+		}
+		delete(tool, "name")
+		tool["function"] = function
+		changed = true
+	}
+	return changed, nil
+}
+
+func normalizeResponsesToolChoice(payload map[string]any) (bool, error) {
+	rawChoice, exists := payload["tool_choice"]
+	if !exists {
+		return false, nil
+	}
+	choice, ok := rawChoice.(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	typeName, _ := choice["type"].(string)
+	if typeName != "function" {
+		return false, nil
+	}
+	if rawFunction, hasFunction := choice["function"]; hasFunction {
+		function, ok := rawFunction.(map[string]any)
+		if !ok {
+			return false, fmt.Errorf("responses tool_choice function must be an object")
+		}
+		name, _ := function["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			if topName, ok := choice["name"].(string); ok && strings.TrimSpace(topName) != "" {
+				function["name"] = topName
+				delete(choice, "name")
+				return true, nil
+			}
+			return false, fmt.Errorf("responses tool_choice function.name is required")
+		}
+		if _, exists := choice["name"]; exists {
+			delete(choice, "name")
+			return true, nil
+		}
+		return false, nil
+	}
+	name, _ := choice["name"].(string)
+	if strings.TrimSpace(name) == "" {
+		return false, fmt.Errorf("responses tool_choice name is required")
+	}
+	delete(choice, "name")
+	choice["function"] = map[string]any{"name": name}
+	return true, nil
 }
 
 // Zen's /v1/responses endpoint emits Responses-shaped output but accepts the
@@ -1695,6 +1887,7 @@ func (g *Gateway) copyFilteredModels(w http.ResponseWriter, resp *http.Response)
 	}
 	payload.Data = filtered
 	copyResponseHeaders(w.Header(), resp.Header)
+	setNoStoreResponseHeaders(w.Header())
 	w.Header().Del("Content-Length")
 	w.Header().Del("Content-Encoding")
 	w.Header().Set("Content-Type", "application/json")
@@ -1828,6 +2021,20 @@ func (g *Gateway) hasUntriedSlot(model string, excluded map[string]struct{}) boo
 	}
 	return false
 }
+
+func (g *Gateway) cooldownModelAllSlots(model string, retryAfter time.Duration) {
+	if model == "" {
+		return
+	}
+	minimum := retryAfter
+	if minimum <= 0 {
+		minimum = g.cfg.CooldownMax
+	}
+	for _, slot := range g.snapshotSlots() {
+		slot.cooldownModel(model, g.cfg.CooldownBase, g.cfg.CooldownMax, minimum)
+	}
+}
+
 func copyHeaders(dst, src http.Header) {
 	for _, key := range []string{"content-type", "accept", "x-opencode-client", "x-opencode-session", "x-opencode-project", "x-opencode-request", "anthropic-version", "anthropic-beta"} {
 		if v := src.Values(key); len(v) > 0 {
@@ -2668,6 +2875,8 @@ func parseTokenUsage(data []byte) tokenUsage {
 		InputTokens      int64 `json:"input_tokens"`
 		OutputTokens     int64 `json:"output_tokens"`
 		TotalTokens      int64 `json:"total_tokens"`
+		PromptCacheHit   int64 `json:"prompt_cache_hit_tokens"`
+		PromptCacheMiss  int64 `json:"prompt_cache_miss_tokens"`
 		PromptDetails    struct {
 			CachedTokens int64 `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
@@ -2699,6 +2908,12 @@ func parseTokenUsage(data []byte) tokenUsage {
 	cachedTokens := usage.PromptDetails.CachedTokens
 	if cachedTokens == 0 {
 		cachedTokens = usage.InputDetails.CachedTokens
+	}
+	if cachedTokens == 0 {
+		cachedTokens = usage.PromptCacheHit
+	}
+	if promptTokens == 0 && usage.PromptCacheHit+usage.PromptCacheMiss > 0 {
+		promptTokens = usage.PromptCacheHit + usage.PromptCacheMiss
 	}
 	totalTokens := usage.TotalTokens
 	if totalTokens == 0 && (promptTokens != 0 || completionTokens != 0) {

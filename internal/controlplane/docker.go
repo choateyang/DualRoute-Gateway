@@ -201,7 +201,7 @@ func (d *dockerClient) inspectManaged(name string) (dockerContainer, error) {
 	return dockerContainer{ID: raw.ID, Names: []string{raw.Name}, Image: raw.Config.Image, State: raw.State.Status, Labels: raw.Config.Labels}, nil
 }
 
-func (d *dockerClient) create(cfg Config, instance Instance, keys []string, zenAPIKey string) error {
+func (d *dockerClient) create(cfg Config, instance Instance, keys []string, upstreamAPIKey string) error {
 	if !instanceNamePattern.MatchString(instance.Name) {
 		return fmt.Errorf("instance name must match %s", instanceNamePattern.String())
 	}
@@ -212,7 +212,7 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, zenA
 		"UPSTREAM_URL=" + upstreamURLForProvider(instance.Provider),
 		"UPSTREAM_PROVIDER=" + instance.Provider,
 		"UPSTREAM_MODEL=" + upstreamModelForProvider(instance.Provider),
-		"UPSTREAM_API_KEY=" + zenAPIKey,
+		"UPSTREAM_API_KEY=" + upstreamAPIKey,
 		"GATEWAY_KEYS=" + strings.Join(keys, ","),
 		"INSTANCE_ADMIN_TOKEN=" + cfg.InstanceToken,
 		"PROXY_URLS=" + strings.Join(instance.ProxyURLs, ","),
@@ -233,6 +233,7 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, zenA
 		"FREE_MODELS_ONLY=" + strconv.FormatBool(instance.Provider == ProviderOpenCode),
 		"DISABLE_THINKING_BY_DEFAULT=" + strconv.FormatBool(instance.Provider == ProviderOpenCode),
 		"MIN_THINKING_MAX_TOKENS=" + providerThinkingTokenBudget(instance.Provider),
+		"ISOLATE_UPSTREAM_STATE=" + env("ISOLATE_UPSTREAM_STATE", "true"),
 	}
 	labels := map[string]string{
 		managedLabel:                        "true",
@@ -304,7 +305,7 @@ func instanceDataVolume(name string) string {
 	return "dualroute-gateway-data-" + name
 }
 
-func (d *dockerClient) replace(cfg Config, instance Instance, keys []string, zenAPIKey string) error {
+func (d *dockerClient) replace(cfg Config, instance Instance, keys []string, upstreamAPIKey string) error {
 	current, err := d.inspectManaged(instance.Name)
 	if err != nil {
 		return err
@@ -316,7 +317,7 @@ func (d *dockerClient) replace(cfg Config, instance Instance, keys []string, zen
 	}
 	backupName := instance.Name + "-previous-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	temporaryName := instance.Name + "-next-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	if err := d.createWithSpecNamed(cfg, temporaryName, instance, keys, zenAPIKey, original); err != nil {
+	if err := d.createWithSpecNamed(cfg, temporaryName, instance, keys, upstreamAPIKey, original); err != nil {
 		return err
 	}
 	removeTemporary := func() {
@@ -356,11 +357,11 @@ func (d *dockerClient) replace(cfg Config, instance Instance, keys []string, zen
 	return nil
 }
 
-func (d *dockerClient) createWithSpec(cfg Config, instance Instance, keys []string, zenAPIKey string, original containerSpec) error {
-	return d.createWithSpecNamed(cfg, instance.Name, instance, keys, zenAPIKey, original)
+func (d *dockerClient) createWithSpec(cfg Config, instance Instance, keys []string, upstreamAPIKey string, original containerSpec) error {
+	return d.createWithSpecNamed(cfg, instance.Name, instance, keys, upstreamAPIKey, original)
 }
 
-func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, instance Instance, keys []string, zenAPIKey string, original containerSpec) error {
+func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, instance Instance, keys []string, upstreamAPIKey string, original containerSpec) error {
 	if !instanceNamePattern.MatchString(instance.Name) {
 		return fmt.Errorf("instance name must match %s", instanceNamePattern.String())
 	}
@@ -371,7 +372,7 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 		"UPSTREAM_URL":      upstreamURLForProvider(instance.Provider),
 		"UPSTREAM_PROVIDER": instance.Provider,
 		"UPSTREAM_MODEL":    upstreamModelForProvider(instance.Provider),
-		"UPSTREAM_API_KEY":  zenAPIKey,
+		"UPSTREAM_API_KEY":  upstreamAPIKey,
 		"PROXY_URLS":        strings.Join(instance.ProxyURLs, ","), "DIRECT_ENABLED": strconv.FormatBool(direct),
 		"MAX_CONCURRENCY": strconv.Itoa(instance.MaxConcurrency), "QUEUE_SIZE": strconv.Itoa(instance.QueueSize), "DATA_DIR": "/data",
 		"MAX_RETRIES": env("MAX_RETRIES", "2"), "REQUEST_TIMEOUT": env("REQUEST_TIMEOUT", "5m"), "STREAM_FIRST_OUTPUT_TIMEOUT": env("STREAM_FIRST_OUTPUT_TIMEOUT", "20s"), "STREAM_FAILURE_COOLDOWN": env("STREAM_FAILURE_COOLDOWN", "10m"),
@@ -379,6 +380,7 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 		"PROXY_PROBE_URL": env("PROXY_PROBE_URL", "https://api.ipify.org,https://ifconfig.me/ip,https://www.cloudflare.com/cdn-cgi/trace"), "PROXY_PROBE_TIMEOUT": env("PROXY_PROBE_TIMEOUT", "10s"),
 		"PROXY_PROBE_CONCURRENCY": env("PROXY_PROBE_CONCURRENCY", "8"), "TARGET_EGRESS_SLOTS": env("TARGET_EGRESS_SLOTS", "0"),
 		"FREE_MODELS_ONLY": strconv.FormatBool(instance.Provider == ProviderOpenCode), "DISABLE_THINKING_BY_DEFAULT": strconv.FormatBool(instance.Provider == ProviderOpenCode), "MIN_THINKING_MAX_TOKENS": providerThinkingTokenBudget(instance.Provider),
+		"ISOLATE_UPSTREAM_STATE": env("ISOLATE_UPSTREAM_STATE", "true"),
 	}
 	environment := mergeEnvironment(original.Config.Env, overrides)
 	labels := map[string]string{}
@@ -557,7 +559,7 @@ func providerOrDefault(provider string) string {
 
 func upstreamURLForProvider(provider string) string {
 	if providerOrDefault(provider) == ProviderOpenCode {
-		return openCodeUpstreamURL
+		return openCodeAPIURL
 	}
 	return defaultUpstreamURL
 }

@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,16 +31,20 @@ const (
 	ProviderTokenRouter = "tokenrouter"
 	ProviderOpenCode    = "opencode"
 
-	defaultUpstreamURL  = "https://api.tokenrouter.com/v1"
-	openCodeUpstreamURL = "https://opencode.ai/zen"
-	tokenRouterModel    = "deepseek/deepseek-v4-pro-0813-free"
-	openCodeModel       = "deepseek-v4-flash-free"
+	defaultUpstreamURL = "https://api.tokenrouter.com/v1"
+	openCodeAPIURL     = "https://opencode.ai/zen"
+	tokenRouterModel   = "deepseek/deepseek-v4-pro-0813-free"
+	openCodeModel      = "deepseek-v4-flash-free"
 )
 
 const (
-	zenAuthModePublic = "public"
-	zenAuthModeCustom = "custom"
+	providerAuthModePublic = "public"
+	providerAuthModeCustom = "custom"
 )
+
+const maxAPIRequestBodyBytes = 16 << 20
+
+var errAPIRequestBodyTooLarge = errors.New("request_body_too_large")
 
 type Config struct {
 	ListenAddr      string
@@ -80,7 +85,7 @@ type Server struct {
 	lifecycleMu      sync.Mutex
 	rotationMu       sync.Mutex
 	keys             []string
-	zenKeys          map[string]string
+	upstreamKeys     map[string]string
 	instances        []Instance
 	rotationLogs     []SystemLog
 	rotationFailures map[string]string
@@ -177,31 +182,31 @@ type LogSource struct {
 	Entries []map[string]any `json:"entries"`
 }
 type Summary struct {
-	Slots          []map[string]any  `json:"slots"`
-	Stats          map[string]uint64 `json:"stats"`
-	MaxConcurrency int               `json:"max_concurrency"`
-	Instance       string            `json:"instance"`
-	Online         bool              `json:"online"`
-	Error          string            `json:"error,omitempty"`
-	Status         string            `json:"status"`
-	Managed        bool              `json:"managed"`
-	Container      string            `json:"container"`
-	ContainerID    string            `json:"container_id,omitempty"`
-	ZenKeyMasked   string            `json:"zen_api_key_masked"`
-	ZenKeySet      bool              `json:"zen_api_key_configured"`
-	ZenAuthMode    string            `json:"zen_auth_mode"`
-	ProxyURLs      []string          `json:"proxy_urls"`
-	QueueSize      int               `json:"queue_size"`
-	Provider       string            `json:"provider"`
-	InTrafficPool  bool              `json:"in_traffic_pool"`
-	InstanceURL    string            `json:"-"`
+	Slots             []map[string]any  `json:"slots"`
+	Stats             map[string]uint64 `json:"stats"`
+	MaxConcurrency    int               `json:"max_concurrency"`
+	Instance          string            `json:"instance"`
+	Online            bool              `json:"online"`
+	Error             string            `json:"error,omitempty"`
+	Status            string            `json:"status"`
+	Managed           bool              `json:"managed"`
+	Container         string            `json:"container"`
+	ContainerID       string            `json:"container_id,omitempty"`
+	UpstreamKeyMasked string            `json:"upstream_api_key_masked"`
+	UpstreamKeySet    bool              `json:"upstream_api_key_configured"`
+	AuthMode          string            `json:"auth_mode"`
+	ProxyURLs         []string          `json:"proxy_urls"`
+	QueueSize         int               `json:"queue_size"`
+	Provider          string            `json:"provider"`
+	InTrafficPool     bool              `json:"in_traffic_pool"`
+	InstanceURL       string            `json:"-"`
 }
 
 type instanceRequest struct {
 	Name           string   `json:"name"`
 	Provider       string   `json:"provider"`
-	ZenAPIKey      string   `json:"zen_api_key"`
-	ZenAuthMode    string   `json:"auth_mode"`
+	UpstreamAPIKey string   `json:"upstream_api_key"`
+	AuthMode       string   `json:"auth_mode"`
 	ProxyURLs      []string `json:"proxy_urls"`
 	MaxConcurrency int      `json:"max_concurrency"`
 	QueueSize      int      `json:"queue_size"`
@@ -229,11 +234,11 @@ func LoadConfig() (Config, error) {
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), zenKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session)}
+	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), upstreamKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session)}
 	s.loadInstanceToken()
 	s.loadAuth()
 	s.loadKeys()
-	s.loadZenKeys()
+	s.loadUpstreamKeys()
 	if len(s.keys) == 0 {
 		s.keys = append([]string(nil), cfg.BootstrapKeys...)
 		s.persistLocked()
@@ -265,7 +270,7 @@ func (s *Server) APIHandler() http.Handler {
 }
 
 func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
-	apiKey := requestBearer(r)
+	apiKey := requestCredential(r)
 	s.mu.RLock()
 	instances := append([]Instance(nil), s.instances...)
 	shared := s.hasGatewayKeyLocked(apiKey)
@@ -279,7 +284,11 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if provider, required, err := requestedProvider(r); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "unsupported_model", err)
+		if errors.Is(err, errAPIRequestBodyTooLarge) {
+			writeAPIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", err)
+		} else {
+			writeAPIError(w, http.StatusBadRequest, "unsupported_model", err)
+		}
 		return
 	} else if required {
 		instances = instancesForProvider(instances, provider)
@@ -290,6 +299,10 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	instance := s.acquireAPIInstance(selected)
+	if instance.Name == "" {
+		http.Error(w, `{"error":"all_gateway_instances_cooling_down"}`, http.StatusServiceUnavailable)
+		return
+	}
 	target, err := url.Parse(instance.URL)
 	if err != nil || target.Host == "" {
 		http.Error(w, `{"error":"invalid_gateway_instance"}`, http.StatusBadGateway)
@@ -302,6 +315,13 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"gateway_unavailable"}`, http.StatusBadGateway)
 	}
 	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode == http.StatusTooManyRequests {
+			if strings.TrimSpace(response.Header.Get("Retry-After")) == "" {
+				response.Header.Set("Retry-After", "60")
+			}
+			s.markAPIInstanceRateLimit(instance.Name, response.Header.Get("Retry-After"))
+			return nil
+		}
 		if response.StatusCode >= http.StatusInternalServerError {
 			s.markAPIInstanceFailure(instance.Name)
 			return nil
@@ -329,9 +349,12 @@ func requestedProvider(r *http.Request) (string, bool, error) {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return "", false, nil
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxAPIRequestBodyBytes+1))
 	if err != nil {
 		return "", false, fmt.Errorf("request_body_unreadable")
+	}
+	if len(body) > maxAPIRequestBodyBytes {
+		return "", false, errAPIRequestBodyTooLarge
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
@@ -454,9 +477,10 @@ func (s *Server) acquireAPIInstance(instances []Instance) Instance {
 			available = append(available, instance)
 		}
 	}
-	if len(available) > 0 {
-		instances = available
+	if len(available) == 0 {
+		return Instance{}
 	}
+	instances = available
 	var selected Instance
 	selectedLoad := int(^uint(0) >> 1)
 	start := int(s.apiCursor.Add(1)-1) % len(instances)
@@ -486,6 +510,20 @@ func (s *Server) markAPIInstanceFailure(name string) {
 	circuit.Until = time.Now().Add(cooldown)
 	s.apiCircuits[name] = circuit
 	s.apiReadiness[name] = apiReadiness{Healthy: false, Until: time.Now().Add(time.Second)}
+}
+
+func (s *Server) markAPIInstanceRateLimit(name, retryAfter string) {
+	cooldown := time.Minute
+	if seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && seconds > 0 {
+		cooldown = time.Duration(seconds) * time.Second
+	}
+	s.apiMu.Lock()
+	circuit := s.apiCircuits[name]
+	circuit.Failures++
+	circuit.Until = time.Now().Add(cooldown)
+	s.apiCircuits[name] = circuit
+	s.apiReadiness[name] = apiReadiness{Healthy: false, Until: time.Now().Add(time.Second)}
+	s.apiMu.Unlock()
 }
 
 func (s *Server) markAPIInstanceSuccess(name string) {
@@ -656,11 +694,15 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"max_instances_reached"}`, http.StatusConflict)
 		return
 	}
+	if owner := proxyURLOwner(instances, request.Name, request.Provider, request.ProxyURLs); owner != "" {
+		http.Error(w, `{"error":"proxy_url_in_use"}`, http.StatusConflict)
+		return
+	}
 	instance := Instance{Name: request.Name, Container: request.Name, URL: "http://" + request.Name + ":13339", Managed: true, Status: "created", ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider}
 	s.mu.RLock()
 	keys := s.gatewayKeysLocked()
 	s.mu.RUnlock()
-	if err := s.docker.create(s.cfg, instance, keys, request.ZenAPIKey); err != nil {
+	if err := s.docker.create(s.cfg, instance, keys, request.UpstreamAPIKey); err != nil {
 		writeAPIError(w, http.StatusBadGateway, "create_failed", err)
 		return
 	}
@@ -702,9 +744,9 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.instances = instances
-	s.zenKeys[request.Name] = request.ZenAPIKey
+	s.upstreamKeys[request.Name] = request.UpstreamAPIKey
 	s.persistInstancesLocked()
-	s.persistZenKeysLocked()
+	s.persistUpstreamKeysLocked()
 	s.mu.Unlock()
 	s.addRotationLog("info", "instance created", request.Name, map[string]any{"proxy_slots": len(request.ProxyURLs), "max_concurrency": request.MaxConcurrency})
 	go func() { _ = s.ReconcileEgresses() }()
@@ -735,33 +777,40 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		s.mu.RUnlock()
 	}
 	s.mu.RLock()
-	currentKey := s.zenKeys[name]
+	currentKey := s.upstreamKeys[name]
 	s.mu.RUnlock()
-	if strings.TrimSpace(request.ZenAuthMode) == "" && strings.TrimSpace(request.ZenAPIKey) == "" {
-		request.ZenAuthMode, request.ZenAPIKey = zenAuthModeForKey(currentKey), currentKey
-		if request.ZenAuthMode == "" {
+	if strings.TrimSpace(request.AuthMode) == "" && strings.TrimSpace(request.UpstreamAPIKey) == "" {
+		request.AuthMode, request.UpstreamAPIKey = providerAuthModeForKey(currentKey), currentKey
+		if request.AuthMode == "" {
 			if request.Provider == ProviderOpenCode {
-				request.ZenAuthMode = zenAuthModePublic
+				request.AuthMode = providerAuthModePublic
 			} else {
-				request.ZenAuthMode = zenAuthModeCustom
+				request.AuthMode = providerAuthModeCustom
 			}
 		}
 	}
-	if request.ZenAuthMode == zenAuthModeCustom && strings.TrimSpace(request.ZenAPIKey) == "" && currentKey != "" && currentKey != zenAuthModePublic {
-		request.ZenAPIKey = currentKey
+	if request.AuthMode == providerAuthModeCustom && strings.TrimSpace(request.UpstreamAPIKey) == "" && currentKey != "" && currentKey != providerAuthModePublic {
+		request.UpstreamAPIKey = currentKey
 	}
 	if code, message := validateInstanceRequest(&request, false); code != 0 {
 		http.Error(w, message, code)
 		return
 	}
-	if request.ZenAuthMode == zenAuthModePublic {
-		request.ZenAPIKey = zenAuthModePublic
+	if request.AuthMode == providerAuthModePublic {
+		request.UpstreamAPIKey = providerAuthModePublic
+	}
+	s.mu.RLock()
+	knownInstances := append([]Instance(nil), s.instances...)
+	s.mu.RUnlock()
+	if owner := proxyURLOwner(knownInstances, name, request.Provider, request.ProxyURLs); owner != "" {
+		http.Error(w, `{"error":"proxy_url_in_use"}`, http.StatusConflict)
+		return
 	}
 	instance := Instance{Name: name, Container: name, URL: "http://" + name + ":13339", Managed: true, ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider}
 	s.mu.RLock()
 	keys := s.gatewayKeysLocked()
 	s.mu.RUnlock()
-	if err := s.docker.replace(s.cfg, instance, keys, request.ZenAPIKey); err != nil {
+	if err := s.docker.replace(s.cfg, instance, keys, request.UpstreamAPIKey); err != nil {
 		http.Error(w, `{"error":"update_failed"}`, http.StatusBadGateway)
 		return
 	}
@@ -770,8 +819,8 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		return
 	}
 	s.mu.Lock()
-	s.zenKeys[name] = request.ZenAPIKey
-	s.persistZenKeysLocked()
+	s.upstreamKeys[name] = request.UpstreamAPIKey
+	s.persistUpstreamKeysLocked()
 	s.mu.Unlock()
 	s.addRotationLog("info", "instance settings updated", name, map[string]any{"proxy_slots": len(request.ProxyURLs), "max_concurrency": request.MaxConcurrency})
 	go func() { _ = s.ReconcileEgresses() }()
@@ -786,31 +835,31 @@ func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int,
 	if request.Provider != ProviderTokenRouter && request.Provider != ProviderOpenCode {
 		return http.StatusBadRequest, `{"error":"invalid_provider"}`
 	}
-	request.ZenAuthMode = strings.ToLower(strings.TrimSpace(request.ZenAuthMode))
-	request.ZenAPIKey = strings.TrimSpace(request.ZenAPIKey)
-	if request.ZenAuthMode == "" {
-		if request.ZenAPIKey != "" {
-			request.ZenAuthMode = zenAuthModeCustom
+	request.AuthMode = strings.ToLower(strings.TrimSpace(request.AuthMode))
+	request.UpstreamAPIKey = strings.TrimSpace(request.UpstreamAPIKey)
+	if request.AuthMode == "" {
+		if request.UpstreamAPIKey != "" {
+			request.AuthMode = providerAuthModeCustom
 		} else if defaultLimits {
-			request.ZenAuthMode = zenAuthModeCustom
+			request.AuthMode = providerAuthModeCustom
 		}
 	}
-	if request.ZenAuthMode != "" && request.ZenAuthMode != zenAuthModePublic && request.ZenAuthMode != zenAuthModeCustom {
+	if request.AuthMode != "" && request.AuthMode != providerAuthModePublic && request.AuthMode != providerAuthModeCustom {
 		return http.StatusBadRequest, `{"error":"invalid_auth_mode"}`
 	}
-	if request.ZenAuthMode == zenAuthModePublic {
+	if request.AuthMode == providerAuthModePublic {
 		if request.Provider != ProviderOpenCode {
 			return http.StatusBadRequest, `{"error":"public_auth_not_supported"}`
 		}
-		request.ZenAPIKey = zenAuthModePublic
+		request.UpstreamAPIKey = providerAuthModePublic
 	}
-	if request.ZenAuthMode == zenAuthModeCustom && request.ZenAPIKey == "" {
-		return http.StatusBadRequest, `{"error":"zen_api_key_required"}`
+	if request.AuthMode == providerAuthModeCustom && request.UpstreamAPIKey == "" {
+		return http.StatusBadRequest, `{"error":"upstream_api_key_required"}`
 	}
-	if request.ZenAPIKey != "" && (len(request.ZenAPIKey) > 512 || strings.IndexFunc(request.ZenAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0) {
-		return http.StatusBadRequest, `{"error":"invalid_zen_api_key"}`
+	if request.UpstreamAPIKey != "" && (len(request.UpstreamAPIKey) > 512 || strings.IndexFunc(request.UpstreamAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0) {
+		return http.StatusBadRequest, `{"error":"invalid_upstream_api_key"}`
 	}
-	if request.ZenAuthMode == zenAuthModeCustom && request.ZenAPIKey == zenAuthModePublic {
+	if request.AuthMode == providerAuthModeCustom && request.UpstreamAPIKey == providerAuthModePublic {
 		return http.StatusBadRequest, `{"error":"custom_key_cannot_be_public"}`
 	}
 	if defaultLimits && request.MaxConcurrency == 0 {
@@ -830,6 +879,30 @@ func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int,
 		}
 	}
 	return 0, ""
+}
+
+func proxyURLOwner(instances []Instance, currentName, provider string, proxyURLs []string) string {
+	wanted := make(map[string]struct{}, len(proxyURLs))
+	for _, raw := range proxyURLs {
+		if value := strings.TrimSpace(raw); value != "" {
+			wanted[value] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return ""
+	}
+	provider = providerOrDefault(provider)
+	for _, instance := range instances {
+		if instance.Name == currentName || providerOrDefault(instance.Provider) != provider {
+			continue
+		}
+		for _, raw := range instance.ProxyURLs {
+			if _, exists := wanted[strings.TrimSpace(raw)]; exists {
+				return instance.Name
+			}
+		}
+	}
+	return ""
 }
 
 func normalizeInstanceName(raw string) string {
@@ -936,8 +1009,8 @@ func (s *Server) instanceDelete(w http.ResponseWriter, name string) {
 	}
 	_ = s.docker.removeDataVolume(name)
 	s.mu.Lock()
-	delete(s.zenKeys, name)
-	s.persistZenKeysLocked()
+	delete(s.upstreamKeys, name)
+	s.persistUpstreamKeysLocked()
 	s.mu.Unlock()
 	if err := s.refreshInstances(); err != nil {
 		http.Error(w, `{"error":"route_refresh_failed"}`, http.StatusBadGateway)
@@ -1240,12 +1313,12 @@ func (s *Server) summary(instance Instance) Summary {
 	out.Container = instance.Container
 	out.ContainerID = instance.ContainerID
 	s.mu.RLock()
-	zenKey := s.zenKeys[instance.Name]
-	out.ZenKeyMasked = maskAPIKey(zenKey)
-	out.ZenKeySet = zenKey != ""
-	out.ZenAuthMode = zenAuthModeForKey(zenKey)
-	if out.ZenAuthMode == zenAuthModePublic {
-		out.ZenKeyMasked = "public（公共 Key）"
+	upstreamKey := s.upstreamKeys[instance.Name]
+	out.UpstreamKeyMasked = maskAPIKey(upstreamKey)
+	out.UpstreamKeySet = upstreamKey != ""
+	out.AuthMode = providerAuthModeForKey(upstreamKey)
+	if out.AuthMode == providerAuthModePublic {
+		out.UpstreamKeyMasked = "public（公共 Key）"
 	}
 	s.mu.RUnlock()
 	out.MaxConcurrency = instance.MaxConcurrency
@@ -1452,19 +1525,37 @@ func (s *Server) loadInstances() {
 		_ = json.Unmarshal(data, &s.instances)
 	}
 }
-func (s *Server) loadZenKeys() {
-	data, err := os.ReadFile(s.cfg.DataDir + "/zen-keys.json")
-	if err == nil {
-		_ = json.Unmarshal(data, &s.zenKeys)
+func (s *Server) loadUpstreamKeys() {
+	data, err := os.ReadFile(s.cfg.DataDir + "/upstream-keys.json")
+	if err != nil {
+		// Migrate a previous provider-key filename once so existing instances keep working.
+		if entries, readErr := os.ReadDir(s.cfg.DataDir); readErr == nil {
+			for _, entry := range entries {
+				name := entry.Name()
+				if entry.IsDir() || name == "upstream-keys.json" || !strings.HasSuffix(name, "-keys.json") {
+					continue
+				}
+				data, err = os.ReadFile(s.cfg.DataDir + "/" + name)
+				if err == nil {
+					break
+				}
+			}
+		}
 	}
-	if s.zenKeys == nil {
-		s.zenKeys = make(map[string]string)
+	if err == nil {
+		_ = json.Unmarshal(data, &s.upstreamKeys)
+	}
+	if s.upstreamKeys == nil {
+		s.upstreamKeys = make(map[string]string)
+	}
+	if len(s.upstreamKeys) > 0 {
+		s.persistUpstreamKeysLocked()
 	}
 }
-func (s *Server) persistZenKeysLocked() {
+func (s *Server) persistUpstreamKeysLocked() {
 	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
-	data, _ := json.MarshalIndent(s.zenKeys, "", "  ")
-	_ = os.WriteFile(s.cfg.DataDir+"/zen-keys.json", data, 0o600)
+	data, _ := json.MarshalIndent(s.upstreamKeys, "", "  ")
+	_ = os.WriteFile(s.cfg.DataDir+"/upstream-keys.json", data, 0o600)
 }
 func (s *Server) persistInstancesLocked() {
 	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
@@ -1486,6 +1577,13 @@ func requestBearer(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimSpace(header[7:])
+}
+
+func requestCredential(r *http.Request) string {
+	if bearer := requestBearer(r); bearer != "" {
+		return bearer
+	}
+	return strings.TrimSpace(r.Header.Get("X-API-Key"))
 }
 func containsKey(keys []string, expected string) bool {
 	for _, key := range keys {
@@ -1525,12 +1623,12 @@ func maskAPIKey(key string) string {
 	}
 	return key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
 }
-func zenAuthModeForKey(key string) string {
-	if strings.TrimSpace(key) == zenAuthModePublic {
-		return zenAuthModePublic
+func providerAuthModeForKey(key string) string {
+	if strings.TrimSpace(key) == providerAuthModePublic {
+		return providerAuthModePublic
 	}
 	if strings.TrimSpace(key) != "" {
-		return zenAuthModeCustom
+		return providerAuthModeCustom
 	}
 	return ""
 }

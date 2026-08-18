@@ -281,11 +281,17 @@ func (s *Server) ReconcileEgresses() error {
 			routeOwners[raw][summary.Instance] = struct{}{}
 		}
 	}
-	occupied := make(map[string]string)
+	occupied := make(map[string]map[string]string)
 	rotated := make(map[string]struct{})
 	var failures []string
 	for _, summary := range summaries {
 		instance := instanceFromSummary(summary)
+		provider := providerOrDefault(summary.Provider)
+		providerOccupied := occupied[provider]
+		if providerOccupied == nil {
+			providerOccupied = make(map[string]string)
+			occupied[provider] = providerOccupied
+		}
 		for _, slot := range activeSummarySlots(summary) {
 			if summarySlotBool(slot, "direct") {
 				continue
@@ -295,9 +301,9 @@ func (s *Server) ReconcileEgresses() error {
 			if net.ParseIP(egress) == nil {
 				continue
 			}
-			owner, duplicate := occupied[egress]
+			owner, duplicate := providerOccupied[egress]
 			if !duplicate {
-				occupied[egress] = summary.Instance
+				providerOccupied[egress] = summary.Instance
 				continue
 			}
 			if owner == summary.Instance {
@@ -310,8 +316,8 @@ func (s *Server) ReconcileEgresses() error {
 				failures = append(failures, err.Error())
 				continue
 			}
-			forbidden := make(map[string]struct{}, len(occupied))
-			for ip := range occupied {
+			forbidden := make(map[string]struct{}, len(providerOccupied))
+			for ip := range providerOccupied {
 				forbidden[ip] = struct{}{}
 			}
 			var result egressRotationResult
@@ -327,7 +333,7 @@ func (s *Server) ReconcileEgresses() error {
 				continue
 			}
 			s.clearRotationFailure(failureKey)
-			occupied[result.Egress] = summary.Instance
+			providerOccupied[result.Egress] = summary.Instance
 			rotated[summary.Instance] = struct{}{}
 			s.addRotationLog("info", "duplicate egress rotated", summary.Instance, map[string]any{"previous_egress": result.PreviousEgress, "egress": result.Egress, "previous_node": result.PreviousNode, "node": result.Node, "attempts": result.Attempts})
 		}
@@ -351,14 +357,20 @@ func (s *Server) ReconcileEgresses() error {
 			continue
 		}
 		instance := instanceFromSummary(summary)
+		provider := providerOrDefault(summary.Provider)
+		providerOccupied := occupied[provider]
+		if providerOccupied == nil {
+			providerOccupied = make(map[string]string)
+			occupied[provider] = providerOccupied
+		}
 		for _, slot := range activeSummarySlots(summary) {
 			raw := summarySlotString(slot, "url")
 			egress := summarySlotString(slot, "egress")
 			if _, ok := mihomoGroupForProxyURL(raw); !ok || net.ParseIP(egress) == nil || len(routeOwners[raw]) > 1 {
 				continue
 			}
-			forbidden := make(map[string]struct{}, len(occupied)+1)
-			for ip, owner := range occupied {
+			forbidden := make(map[string]struct{}, len(providerOccupied)+1)
+			for ip, owner := range providerOccupied {
 				if owner != summary.Instance {
 					forbidden[ip] = struct{}{}
 				}
@@ -425,8 +437,12 @@ func (s *Server) RotateInstanceEgress(name string) (egressRotationResult, error)
 		return egressRotationResult{}, fmt.Errorf("instance %q is not running", name)
 	}
 	forbidden := make(map[string]struct{})
+	targetProvider := providerOrDefault(target.Provider)
 	routeOwners := make(map[string]map[string]struct{})
 	for _, summary := range summaries {
+		if providerOrDefault(summary.Provider) != targetProvider {
+			continue
+		}
 		for _, slot := range activeSummarySlots(summary) {
 			raw := summarySlotString(slot, "url")
 			egress := summarySlotString(slot, "egress")

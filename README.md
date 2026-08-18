@@ -4,7 +4,7 @@
 
 当前版本：**双上游版（2026-08-18）**
 
-> 上游可用性、额度与限流由 OpenCode 和 TokenRouter 决定。增加实例或出口不等于增加上游账户额度。
+> 上游可用性、额度与限流由 TokenRouter 决定。增加实例或出口不等于增加上游账户额度。
 
 ## 功能概览
 
@@ -14,9 +14,9 @@
 - 一组网关访问密钥可访问全部已部署的上游；控制面按客户端请求的模型名选择对应实例。
 - TokenRouter 固定使用 `deepseek/deepseek-v4-pro-0813-free`，OpenCode 固定使用 `deepseek-v4-flash-free`。
 - 导入 Clash/Mihomo 订阅，将 VLESS、Trojan、Shadowsocks、VMess、Hysteria2 等节点转换为本地 SOCKS5 端口。
-- 实例固定使用当前健康出口；仅在 429、连接故障、出口冲突或手动换线时切换。
+- 实例固定使用当前健康出口；网络故障、响应截断、出口冲突或手动换线时切换出口；TokenRouter 429 冷却当前实例 Key 并由控制面选择其他实例。
 - 审计、日志和 Token 统计覆盖所有已转发接口路径（包括 `/v1/chat/completions`、`/v1/responses` 和模型查询），可按接口、实例、模型、脱敏调用密钥及流式状态筛选；支持首字耗时、Token 速度和 USD 费用展示。
-- `/v1/responses` 原样转发 OpenAI Responses 请求，并保留流式生命周期兼容处理。
+- `/v1/responses` 兼容 OpenAI Responses 请求；网关会按上游需要规范化函数工具、`tool_choice`、输入内容和流式生命周期。
 - 实例启动后通过 `/healthz` 预检，只有健康实例进入统一 API 流量池。
 
 ### 控制台展示
@@ -88,7 +88,7 @@ socks5h://mihomo:10802
 
 `vless://`、`trojan://`、`ss://` 分享链接和 Cloudflare `IP:443` 不是实例代理地址，需先由 Mihomo 或其他客户端转换为 HTTP/SOCKS5 服务。
 
-普通请求会保持当前出口。上游 429 会按“实例 + 模型 + 出口”冷却并在健康候选中有限切换；网络错误、响应截断和重复公网出口也会触发换线。流式请求在 `STREAM_FIRST_OUTPUT_TIMEOUT` 内未出现文本、推理、工具调用或 Responses 完成事件时，会冷却当前出口并切换；已向客户端输出内容后不会中途重试，以免重复或拼接回复。
+普通请求会保持当前出口。网络错误、5xx、响应截断和重复公网出口会在实例内切换出口；TokenRouter 429 按“实例对应 Key + 模型”冷却全部出口，由控制面后续请求选择其他 Key。流式请求在 `STREAM_FIRST_OUTPUT_TIMEOUT` 内未出现文本、推理、工具调用或 Responses 完成事件时，会冷却当前出口并切换；已向客户端输出内容后不会中途重试，以免重复或拼接回复。
 
 ## 常用配置
 
@@ -103,6 +103,7 @@ socks5h://mihomo:10802
 | `FREE_MODELS_ONLY` | `false` | 保持 TokenRouter 模型名原样，不自动追加 `-free` |
 | `DISABLE_THINKING_BY_DEFAULT` | `false` | 保持客户端推理参数原样 |
 | `MIN_THINKING_MAX_TOKENS` | `0` | 不调整客户端输出预算 |
+| `ISOLATE_UPSTREAM_STATE` | `true` | TokenRouter 默认移除会话状态字段，避免复用上游 Worker/KV 状态 |
 | `MAX_RETRIES` | `2` | 上游 429、5xx 或首输出前断流后，最多额外尝试的不同出口数 |
 | `STREAM_FIRST_OUTPUT_TIMEOUT` | `20s` | 流式请求等待首个有效事件的最长时间；`0` 关闭 |
 | `STREAM_FAILURE_COOLDOWN` | `10m` | 首输出前断流或超时的出口对当前模型的最低冷却时间；`0` 关闭额外冷却 |
@@ -110,6 +111,8 @@ socks5h://mihomo:10802
 完整变量说明见 [config.example.env](./config.example.env)。
 
 客户端传入的模型名由实例所属上游强制替换：TokenRouter 为 `deepseek/deepseek-v4-pro-0813-free`，OpenCode 为 `deepseek-v4-flash-free`。Responses `input` 与推理参数按上游兼容策略处理。
+
+实例设置接口使用通用字段 `upstream_api_key`、`auth_mode`；控制面保存的上游密钥位于 `data/control/upstream-keys.json`。升级时会自动读取上一版本的提供商密钥文件并迁移到新文件，已有实例无需重新录入。
 
 ## 单域名反代
 

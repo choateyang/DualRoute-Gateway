@@ -24,3 +24,19 @@ func TestStaticAssetsDisableStaleCaching(t *testing.T) {
 		t.Fatal("static stylesheet body does not contain the embedded application CSS")
 	}
 }
+
+func TestProxyURLOwnerIsScopedByProviderAndCurrentInstance(t *testing.T) {
+	instances := []Instance{
+		{Name: "gateway-a", Provider: ProviderTokenRouter, ProxyURLs: []string{"socks5h://mihomo:10801"}},
+		{Name: "gateway-b", Provider: ProviderOpenCode, ProxyURLs: []string{"socks5h://mihomo:10801"}},
+	}
+	if got := proxyURLOwner(instances, "gateway-c", ProviderTokenRouter, []string{"socks5h://mihomo:10801"}); got != "gateway-a" {
+		t.Fatalf("TokenRouter owner = %q, want gateway-a", got)
+	}
+	if got := proxyURLOwner(instances, "gateway-c", ProviderOpenCode, []string{"socks5h://mihomo:10801"}); got != "gateway-b" {
+		t.Fatalf("OpenCode owner = %q, want gateway-b", got)
+	}
+	if got := proxyURLOwner(instances, "gateway-a", ProviderTokenRouter, []string{"socks5h://mihomo:10801"}); got != "" {
+		t.Fatalf("current instance owner = %q, want empty", got)
+	}
+}
