@@ -30,12 +30,30 @@ var assets embed.FS
 const (
 	ProviderTokenRouter = "tokenrouter"
 	ProviderOpenCode    = "opencode"
+	ProviderCline       = "cline"
+	ProviderFreeBuff    = "freebuff"
 
-	defaultUpstreamURL = "https://api.tokenrouter.com/v1"
-	openCodeAPIURL     = "https://opencode.ai/zen"
-	tokenRouterModel   = "deepseek/deepseek-v4-pro-0813-free"
-	openCodeModel      = "deepseek-v4-flash-free"
+	defaultUpstreamURL     = "https://api.tokenrouter.com/v1"
+	openCodeAPIURL         = "https://opencode.ai/zen"
+	clineAPIURL            = "https://api.cline.bot/api/v1"
+	freeBuffAPIURL         = "https://www.codebuff.com"
+	tokenRouterModel       = "deepseek/deepseek-v4-pro-0813-free"
+	openCodeModel          = "deepseek-v4-flash-free"
+	tokenRouterClientModel = "TokenRouter/deepseek-v4-pro"
+	openCodeClientModel    = "OpenCode/deepseek-v4-flash"
+	clineClientModel       = "cline/deepseek-v4-flash"
+	clineUpstreamModel     = "deepseek/deepseek-v4-flash"
 )
+
+var openCodeModels = []string{
+	"big-pickle",
+	"deepseek-v4-flash-free",
+	"hy3-free",
+	"laguna-s-2.1-free",
+	"mimo-v2.5-free",
+	"nemotron-3-ultra-free",
+	"nemotron-3.5-lightning-free",
+}
 
 const (
 	providerAuthModePublic = "public"
@@ -43,6 +61,8 @@ const (
 )
 
 const maxAPIRequestBodyBytes = 16 << 20
+
+const instanceHealthyHeader = "X-DualRoute-Instance-Healthy"
 
 var errAPIRequestBodyTooLarge = errors.New("request_body_too_large")
 
@@ -77,6 +97,9 @@ type Instance struct {
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
 	QueueSize      int      `json:"queue_size,omitempty"`
 	Provider       string   `json:"provider"`
+	ClineTaskID    string   `json:"cline_task_id,omitempty"`
+	UpstreamKeyID  string   `json:"upstream_key_id,omitempty"`
+	UpstreamKeyIDs []string `json:"upstream_key_ids,omitempty"`
 }
 type Server struct {
 	cfg              Config
@@ -90,6 +113,17 @@ type Server struct {
 	rotationLogs     []SystemLog
 	rotationFailures map[string]string
 	lastUpstream429  map[string]uint64
+	clineModelsMu    sync.RWMutex
+	clineModels      map[string]struct{}
+	providerModelsMu sync.RWMutex
+	freeBuffModels   []string
+	freeBuffModelsAt time.Time
+	geoIPMu          sync.Mutex
+	geoIPCache       map[string]geoIPResult
+	geoIPClient      *http.Client
+	geoIPBaseURL     string
+	providerKeys     []ProviderKey
+	modelSettings    ModelSettings
 	docker           *dockerClient
 	apiMu            sync.Mutex
 	apiInflight      map[string]int
@@ -138,6 +172,7 @@ type AuditRecord struct {
 	Method           string         `json:"method"`
 	Path             string         `json:"path"`
 	Model            string         `json:"model,omitempty"`
+	ClientModel      string         `json:"client_model,omitempty"`
 	Status           int            `json:"status"`
 	Slot             string         `json:"slot"`
 	Egress           string         `json:"egress,omitempty"`
@@ -194,6 +229,9 @@ type Summary struct {
 	ContainerID       string            `json:"container_id,omitempty"`
 	UpstreamKeyMasked string            `json:"upstream_api_key_masked"`
 	UpstreamKeySet    bool              `json:"upstream_api_key_configured"`
+	UpstreamKeyID     string            `json:"upstream_key_id,omitempty"`
+	UpstreamKeyIDs    []string          `json:"upstream_key_ids,omitempty"`
+	UpstreamKeyLabel  string            `json:"upstream_key_label,omitempty"`
 	AuthMode          string            `json:"auth_mode"`
 	ProxyURLs         []string          `json:"proxy_urls"`
 	QueueSize         int               `json:"queue_size"`
@@ -206,10 +244,13 @@ type instanceRequest struct {
 	Name           string   `json:"name"`
 	Provider       string   `json:"provider"`
 	UpstreamAPIKey string   `json:"upstream_api_key"`
+	UpstreamKeyID  string   `json:"upstream_key_id"`
+	UpstreamKeyIDs []string `json:"upstream_key_ids"`
 	AuthMode       string   `json:"auth_mode"`
 	ProxyURLs      []string `json:"proxy_urls"`
 	MaxConcurrency int      `json:"max_concurrency"`
 	QueueSize      int      `json:"queue_size"`
+	ClineTaskID    string   `json:"cline_task_id,omitempty"`
 }
 
 func LoadConfig() (Config, error) {
@@ -234,11 +275,13 @@ func LoadConfig() (Config, error) {
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), upstreamKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session)}
+	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), upstreamKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session), clineModels: make(map[string]struct{}), modelSettings: defaultModelSettings(), freeBuffModels: append([]string(nil), freeBuffFallbackModels...), geoIPCache: make(map[string]geoIPResult), geoIPClient: &http.Client{Timeout: 3 * time.Second}, geoIPBaseURL: env("GEOIP_URL", "https://ipwho.is")}
 	s.loadInstanceToken()
 	s.loadAuth()
 	s.loadKeys()
 	s.loadUpstreamKeys()
+	s.loadProviderKeys()
+	s.loadModelSettings()
 	if len(s.keys) == 0 {
 		s.keys = append([]string(nil), cfg.BootstrapKeys...)
 		s.persistLocked()
@@ -283,7 +326,7 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		s.models(w, instances)
 		return
 	}
-	if provider, required, err := requestedProvider(r); err != nil {
+	if provider, required, err := s.requestedProvider(r); err != nil {
 		if errors.Is(err, errAPIRequestBodyTooLarge) {
 			writeAPIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large", err)
 		} else {
@@ -315,15 +358,25 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"gateway_unavailable"}`, http.StatusBadGateway)
 	}
 	proxy.ModifyResponse = func(response *http.Response) error {
+		instanceHealthy := strings.EqualFold(strings.TrimSpace(response.Header.Get(instanceHealthyHeader)), "true")
+		response.Header.Del(instanceHealthyHeader)
 		if response.StatusCode == http.StatusTooManyRequests {
 			if strings.TrimSpace(response.Header.Get("Retry-After")) == "" {
 				response.Header.Set("Retry-After", "60")
 			}
-			s.markAPIInstanceRateLimit(instance.Name, response.Header.Get("Retry-After"))
+			if providerOrDefault(instance.Provider) == ProviderTokenRouter {
+				// TokenRouter limits are account/key scoped, so select another
+				// instance. OpenCode and Cline manage exit/model cooling internally.
+				s.markAPIInstanceRateLimit(instance.Name, response.Header.Get("Retry-After"))
+			}
 			return nil
 		}
 		if response.StatusCode >= http.StatusInternalServerError {
-			s.markAPIInstanceFailure(instance.Name)
+			if instanceHealthy {
+				s.markAPIInstanceSuccess(instance.Name)
+			} else {
+				s.markAPIInstanceFailure(instance.Name)
+			}
 			return nil
 		}
 		response.Body = &observedResponseBody{
@@ -345,7 +398,7 @@ func isModelsRequest(path string) bool {
 	return path == "/v1/models" || path == "/openai/v1/models"
 }
 
-func requestedProvider(r *http.Request) (string, bool, error) {
+func (s *Server) requestedProvider(r *http.Request) (string, bool, error) {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return "", false, nil
 	}
@@ -362,44 +415,176 @@ func requestedProvider(r *http.Request) (string, bool, error) {
 		Model string `json:"model"`
 	}
 	if len(body) == 0 || json.Unmarshal(body, &request) != nil || strings.TrimSpace(request.Model) == "" {
+		if isClineClientType(r.Header.Get("X-CLIENT-TYPE")) {
+			if !s.providerEnabled(ProviderCline) {
+				return "", false, fmt.Errorf("provider %q is disabled", ProviderCline)
+			}
+			return ProviderCline, true, nil
+		}
 		return "", false, nil
 	}
-	switch strings.TrimSpace(request.Model) {
-	case tokenRouterModel:
-		return ProviderTokenRouter, true, nil
-	case openCodeModel:
-		return ProviderOpenCode, true, nil
-	default:
-		return "", false, fmt.Errorf("model must be %q or %q", tokenRouterModel, openCodeModel)
+	if isClineClientType(r.Header.Get("X-CLIENT-TYPE")) {
+		s.registerClineModel(request.Model)
+		clineModel, _ := providerModelFromClient(ProviderCline, request.Model)
+		if !s.modelEnabled(ProviderCline, clineModel) {
+			return "", false, fmt.Errorf("model %q is disabled", request.Model)
+		}
+		return ProviderCline, true, nil
+	}
+	model := strings.TrimSpace(request.Model)
+	if provider, upstreamModel, ok := providerFromClientModel(model); ok {
+		if provider == ProviderFreeBuff && strings.HasPrefix(strings.ToLower(model), "freebuff/") {
+			s.refreshFreeBuffModels()
+			for _, candidate := range s.modelCatalog() {
+				if candidate.ID != ProviderFreeBuff {
+					continue
+				}
+				for _, item := range candidate.Models {
+					if strings.EqualFold(item.ClientModel, model) {
+						upstreamModel = item.ID
+						break
+					}
+				}
+			}
+		}
+		if !s.modelEnabled(provider, upstreamModel) {
+			return "", false, fmt.Errorf("model %q is disabled", model)
+		}
+		if provider == ProviderFreeBuff && !catalogContains(s.modelCatalog(), provider, upstreamModel) {
+			return "", false, fmt.Errorf("unknown FreeBuff model %q", upstreamModel)
+		}
+		return provider, true, nil
+	}
+	if strings.HasPrefix(strings.ToLower(model), "freebuff/") {
+		for _, candidate := range s.modelCatalog() {
+			if candidate.ID != ProviderFreeBuff {
+				continue
+			}
+			for _, item := range candidate.Models {
+				if item.ClientModel == model {
+					if !s.modelEnabled(ProviderFreeBuff, item.ID) {
+						return "", false, fmt.Errorf("model %q is disabled", model)
+					}
+					return ProviderFreeBuff, true, nil
+				}
+			}
+		}
+	}
+	{
+		s.clineModelsMu.RLock()
+		_, clineModel := s.clineModels[model]
+		s.clineModelsMu.RUnlock()
+		if clineModel {
+			if !s.modelEnabled(ProviderCline, model) {
+				return "", false, fmt.Errorf("model %q is disabled", model)
+			}
+			return ProviderCline, true, nil
+		}
+		return "", false, fmt.Errorf("model must use a configured provider alias")
 	}
 }
 
+func isClineClientType(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "cline-vscode" || value == "cline-cli"
+}
+
+func (s *Server) registerClineModel(model string) {
+	model = strings.TrimSpace(model)
+	if upstream, ok := providerModelFromClient(ProviderCline, model); ok {
+		model = upstream
+	}
+	if model == "" {
+		return
+	}
+	s.clineModelsMu.Lock()
+	s.clineModels[model] = struct{}{}
+	s.clineModelsMu.Unlock()
+}
+
 func (s *Server) models(w http.ResponseWriter, instances []Instance) {
+	s.refreshFreeBuffModels()
+	s.refreshClineModels(instances)
 	providers := make(map[string]bool)
 	for _, instance := range instances {
 		providers[providerOrDefault(instance.Provider)] = true
 	}
-	models := make([]map[string]any, 0, 2)
-	if providers[ProviderTokenRouter] {
-		models = append(models, map[string]any{"id": tokenRouterModel, "object": "model", "owned_by": "tokenrouter"})
-	}
-	if providers[ProviderOpenCode] {
-		models = append(models, map[string]any{
-			"id":                      openCodeModel,
-			"object":                  "model",
-			"owned_by":                "opencode",
-			"contextWindow":           1000000,
-			"supportsReasoningEffort": true,
-			"reasoningEffort":         "none",
-			"reasoningEfforts": []map[string]any{
-				{"value": "none", "label": "None", "default": true},
-				{"value": "low", "label": "Low"},
-				{"value": "medium", "label": "Medium"},
-				{"value": "high", "label": "High"},
-			},
-		})
+	models := make([]map[string]any, 0, 16)
+	for _, group := range s.modelCatalog() {
+		if !providers[group.ID] || !group.Enabled {
+			continue
+		}
+		for _, catalogModel := range group.Models {
+			if !catalogModel.Enabled {
+				continue
+			}
+			model := map[string]any{"id": catalogModel.ClientModel, "object": "model", "owned_by": group.ID}
+			if group.ID == ProviderOpenCode {
+				model["contextWindow"] = 1000000
+				model["supportsReasoningEffort"] = true
+				model["reasoningEffort"] = "none"
+				model["reasoningEfforts"] = []map[string]any{{"value": "none", "label": "None", "default": true}, {"value": "low", "label": "Low"}, {"value": "medium", "label": "Medium"}, {"value": "high", "label": "High"}}
+			} else if group.ID == ProviderCline {
+				model["contextWindow"] = 131072
+				model["maxTokens"] = 4096
+				model["reasoning"] = true
+			} else if group.ID == ProviderFreeBuff {
+				model["reasoning"] = true
+			}
+			models = append(models, model)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func (s *Server) refreshClineModels(instances []Instance) {
+	var key string
+	s.mu.RLock()
+	if len(s.keys) > 0 {
+		key = s.keys[0]
+	}
+	s.mu.RUnlock()
+	if key == "" {
+		return
+	}
+	for _, instance := range instances {
+		if providerOrDefault(instance.Provider) != ProviderCline || instance.Status != "running" || instance.URL == "" {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet, strings.TrimRight(instance.URL, "/")+"/v1/models", nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			continue
+		}
+		var payload struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		err = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			continue
+		}
+		models := make(map[string]struct{})
+		for _, model := range payload.Data {
+			if id := strings.TrimSpace(model.ID); id != "" {
+				models[id] = struct{}{}
+			}
+		}
+		if len(models) == 0 {
+			continue
+		}
+		s.clineModelsMu.Lock()
+		for id := range models {
+			s.clineModels[id] = struct{}{}
+		}
+		s.clineModelsMu.Unlock()
+	}
 }
 
 func (s *Server) readyTrafficPool(instances []Instance) []Instance {
@@ -560,7 +745,7 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 	if page == "" {
 		page = "instances"
 	}
-	titles := map[string]string{"instances": "实例与出口", "mihomo": "Mihomo 转换", "keys": "访问密钥", "logs": "审计与日志", "tokens": "API Token 统计"}
+	titles := map[string]string{"instances": "实例与出口", "mihomo": "Mihomo 转换", "upstreams": "上游密钥", "models": "模型管理", "keys": "访问密钥", "logs": "审计与日志", "tokens": "API Token 统计"}
 	title, ok := titles[page]
 	if !ok {
 		http.NotFound(w, r)
@@ -632,6 +817,12 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"keys": keys})
 	case path == "/keys" && r.Method == "POST":
 		s.createKey(w, r)
+	case path == "/provider-keys":
+		s.providerKeysAPI(w, r)
+	case strings.HasPrefix(path, "/provider-keys/") && r.Method == http.MethodDelete:
+		s.deleteProviderKey(w, strings.TrimPrefix(path, "/provider-keys/"))
+	case path == "/model-settings":
+		s.modelSettingsAPI(w, r)
 	case path == "/mihomo" && r.Method == "GET":
 		s.mihomoStatus(w)
 	case path == "/mihomo/probe" && r.Method == "POST":
@@ -707,11 +898,43 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"max_instances_reached"}`, http.StatusConflict)
 		return
 	}
+	if request.Provider == ProviderCline {
+		request.ClineTaskID = newUUID()
+	}
+	if request.Provider == ProviderOpenCode {
+		request.AuthMode = providerAuthModePublic
+		request.UpstreamAPIKey = providerAuthModePublic
+		request.UpstreamKeyID = ""
+	} else if len(request.UpstreamKeyIDs) > 0 || request.UpstreamKeyID != "" {
+		ids := request.UpstreamKeyIDs
+		if len(ids) == 0 {
+			ids = []string{request.UpstreamKeyID}
+		}
+		secrets := make([]string, 0, len(ids))
+		for _, id := range ids {
+			secret, found := s.providerKeySecret(id, request.Provider)
+			if !found {
+				http.Error(w, `{"error":"provider_key_not_found"}`, http.StatusBadRequest)
+				return
+			}
+			secrets = append(secrets, secret)
+		}
+		request.UpstreamKeyIDs = ids
+		request.UpstreamKeyID = ids[0]
+		request.UpstreamAPIKey = strings.Join(secrets, ",")
+		if request.UpstreamAPIKey == "" {
+			http.Error(w, `{"error":"provider_key_not_found"}`, http.StatusBadRequest)
+			return
+		}
+	} else if request.UpstreamAPIKey == "" {
+		http.Error(w, `{"error":"upstream_key_id_required"}`, http.StatusBadRequest)
+		return
+	}
 	if owner := proxyURLOwner(instances, request.Name, request.Provider, request.ProxyURLs); owner != "" {
 		http.Error(w, `{"error":"proxy_url_in_use"}`, http.StatusConflict)
 		return
 	}
-	instance := Instance{Name: request.Name, Container: request.Name, URL: "http://" + request.Name + ":13339", Managed: true, Status: "created", ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider}
+	instance := Instance{Name: request.Name, Container: request.Name, URL: "http://" + request.Name + ":13339", Managed: true, Status: "created", ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider, ClineTaskID: request.ClineTaskID, UpstreamKeyID: request.UpstreamKeyID, UpstreamKeyIDs: request.UpstreamKeyIDs}
 	s.mu.RLock()
 	keys := s.gatewayKeysLocked()
 	s.mu.RUnlock()
@@ -757,7 +980,11 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.instances = instances
-	s.upstreamKeys[request.Name] = request.UpstreamAPIKey
+	if request.UpstreamKeyID == "" {
+		s.upstreamKeys[request.Name] = request.UpstreamAPIKey
+	} else {
+		delete(s.upstreamKeys, request.Name)
+	}
 	s.persistInstancesLocked()
 	s.persistUpstreamKeysLocked()
 	s.mu.Unlock()
@@ -779,11 +1006,22 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		return
 	}
 	request.Name = name
+	var currentInstance Instance
 	if request.Provider == "" {
 		s.mu.RLock()
 		for _, instance := range s.instances {
 			if instance.Name == name {
+				currentInstance = instance
 				request.Provider = instance.Provider
+				break
+			}
+		}
+		s.mu.RUnlock()
+	} else {
+		s.mu.RLock()
+		for _, instance := range s.instances {
+			if instance.Name == name {
+				currentInstance = instance
 				break
 			}
 		}
@@ -792,6 +1030,9 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 	s.mu.RLock()
 	currentKey := s.upstreamKeys[name]
 	s.mu.RUnlock()
+	if request.UpstreamKeyID != "" {
+		request.AuthMode = providerAuthModeCustom
+	}
 	if strings.TrimSpace(request.AuthMode) == "" && strings.TrimSpace(request.UpstreamAPIKey) == "" {
 		request.AuthMode, request.UpstreamAPIKey = providerAuthModeForKey(currentKey), currentKey
 		if request.AuthMode == "" {
@@ -809,8 +1050,54 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		http.Error(w, message, code)
 		return
 	}
-	if request.AuthMode == providerAuthModePublic {
+	if request.Provider == ProviderOpenCode {
+		request.AuthMode = providerAuthModePublic
 		request.UpstreamAPIKey = providerAuthModePublic
+		request.UpstreamKeyID = ""
+	} else {
+		if request.UpstreamKeyID == "" && currentInstance.Provider == request.Provider {
+			request.UpstreamKeyID = currentInstance.UpstreamKeyID
+			request.UpstreamKeyIDs = append([]string(nil), currentInstance.UpstreamKeyIDs...)
+		}
+		if len(request.UpstreamKeyIDs) > 0 || request.UpstreamKeyID != "" {
+			ids := request.UpstreamKeyIDs
+			if len(ids) == 0 {
+				ids = []string{request.UpstreamKeyID}
+			}
+			secrets := make([]string, 0, len(ids))
+			for _, id := range ids {
+				secret, found := s.providerKeySecret(id, request.Provider)
+				if !found {
+					http.Error(w, `{"error":"provider_key_not_found"}`, http.StatusBadRequest)
+					return
+				}
+				secrets = append(secrets, secret)
+			}
+			request.UpstreamKeyIDs = ids
+			request.UpstreamKeyID = ids[0]
+			request.UpstreamAPIKey = strings.Join(secrets, ",")
+			if request.UpstreamAPIKey == "" {
+				http.Error(w, `{"error":"provider_key_not_found"}`, http.StatusBadRequest)
+				return
+			}
+		} else if request.UpstreamAPIKey == "" {
+			http.Error(w, `{"error":"upstream_key_id_required"}`, http.StatusBadRequest)
+			return
+		}
+	}
+	if request.Provider == ProviderCline {
+		request.ClineTaskID = ""
+		s.mu.RLock()
+		for _, current := range s.instances {
+			if current.Name == name {
+				request.ClineTaskID = current.ClineTaskID
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if request.ClineTaskID == "" {
+			request.ClineTaskID = newUUID()
+		}
 	}
 	s.mu.RLock()
 	knownInstances := append([]Instance(nil), s.instances...)
@@ -819,7 +1106,7 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		http.Error(w, `{"error":"proxy_url_in_use"}`, http.StatusConflict)
 		return
 	}
-	instance := Instance{Name: name, Container: name, URL: "http://" + name + ":13339", Managed: true, ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider}
+	instance := Instance{Name: name, Container: name, URL: "http://" + name + ":13339", Managed: true, ProxyURLs: request.ProxyURLs, MaxConcurrency: request.MaxConcurrency, QueueSize: request.QueueSize, Provider: request.Provider, ClineTaskID: request.ClineTaskID, UpstreamKeyID: request.UpstreamKeyID, UpstreamKeyIDs: request.UpstreamKeyIDs}
 	s.mu.RLock()
 	keys := s.gatewayKeysLocked()
 	s.mu.RUnlock()
@@ -832,7 +1119,11 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 		return
 	}
 	s.mu.Lock()
-	s.upstreamKeys[name] = request.UpstreamAPIKey
+	if request.UpstreamKeyID == "" {
+		s.upstreamKeys[name] = request.UpstreamAPIKey
+	} else {
+		delete(s.upstreamKeys, name)
+	}
 	s.persistUpstreamKeysLocked()
 	s.mu.Unlock()
 	s.addRotationLog("info", "instance settings updated", name, map[string]any{"proxy_slots": len(request.ProxyURLs), "max_concurrency": request.MaxConcurrency})
@@ -845,12 +1136,15 @@ func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int,
 	if request.Provider == "" {
 		request.Provider = ProviderTokenRouter
 	}
-	if request.Provider != ProviderTokenRouter && request.Provider != ProviderOpenCode {
+	if request.Provider != ProviderTokenRouter && request.Provider != ProviderOpenCode && request.Provider != ProviderCline && request.Provider != ProviderFreeBuff {
 		return http.StatusBadRequest, `{"error":"invalid_provider"}`
 	}
 	request.AuthMode = strings.ToLower(strings.TrimSpace(request.AuthMode))
 	request.UpstreamAPIKey = strings.TrimSpace(request.UpstreamAPIKey)
-	if request.AuthMode == "" {
+	if request.Provider == ProviderOpenCode {
+		request.AuthMode = providerAuthModePublic
+		request.UpstreamAPIKey = providerAuthModePublic
+	} else if request.AuthMode == "" {
 		if request.UpstreamAPIKey != "" {
 			request.AuthMode = providerAuthModeCustom
 		} else if defaultLimits {
@@ -866,11 +1160,15 @@ func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int,
 		}
 		request.UpstreamAPIKey = providerAuthModePublic
 	}
-	if request.AuthMode == providerAuthModeCustom && request.UpstreamAPIKey == "" {
+	if request.AuthMode == providerAuthModeCustom && request.UpstreamAPIKey == "" && request.UpstreamKeyID == "" && len(request.UpstreamKeyIDs) == 0 {
 		return http.StatusBadRequest, `{"error":"upstream_api_key_required"}`
 	}
-	if request.UpstreamAPIKey != "" && (len(request.UpstreamAPIKey) > 512 || strings.IndexFunc(request.UpstreamAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0) {
-		return http.StatusBadRequest, `{"error":"invalid_upstream_api_key"}`
+	if request.UpstreamAPIKey != "" {
+		for _, key := range split(request.UpstreamAPIKey) {
+			if len(key) > 512 || strings.IndexFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+				return http.StatusBadRequest, `{"error":"invalid_upstream_api_key"}`
+			}
+		}
 	}
 	if request.AuthMode == providerAuthModeCustom && request.UpstreamAPIKey == providerAuthModePublic {
 		return http.StatusBadRequest, `{"error":"custom_key_cannot_be_public"}`
@@ -951,6 +1249,17 @@ func nextInstanceName(instances []Instance) string {
 			return candidate
 		}
 	}
+}
+
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		n := uint64(time.Now().UnixNano())
+		return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x", n>>32, n>>16&0xffff, n&0x0fff, n>>12&0x0fff, n&0xffffffffffff)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]), hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
 }
 
 func (s *Server) instanceAction(w http.ResponseWriter, r *http.Request, name string) {
@@ -1145,6 +1454,10 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	keyFilter := strings.TrimSpace(query.Get("key"))
 	statusFilter := strings.TrimSpace(query.Get("status"))
 	pathFilter := strings.TrimSpace(query.Get("path"))
+	instanceProviders := make(map[string]string, len(instances))
+	for _, instance := range instances {
+		instanceProviders[instance.Name] = providerOrDefault(instance.Provider)
+	}
 	var records []AuditRecord
 	summary := struct {
 		Requests         int64   `json:"requests"`
@@ -1161,7 +1474,8 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	}{}
 	for _, list := range audits {
 		for _, record := range list {
-			if instanceFilter != "" && record.Instance != instanceFilter || modelFilter != "" && record.Model != modelFilter || keyFilter != "" && record.ClientKey != keyFilter || statusFilter != "" && strconv.Itoa(record.Status) != statusFilter || pathFilter != "" && record.Path != pathFilter {
+			record.ClientModel = clientModelForAuditRecord(record, instanceProviders)
+			if instanceFilter != "" && record.Instance != instanceFilter || modelFilter != "" && record.ClientModel != modelFilter || keyFilter != "" && record.ClientKey != keyFilter || statusFilter != "" && strconv.Itoa(record.Status) != statusFilter || pathFilter != "" && record.Path != pathFilter {
 				continue
 			}
 			inputCost, outputCost, cacheCost := tokenCostsUSD(record.Model, record.PromptTokens, record.CompletionTokens, record.CachedTokens)
@@ -1191,6 +1505,18 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 		records = records[:500]
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "records": records})
+}
+
+func clientModelForAuditRecord(record AuditRecord, instanceProviders map[string]string) string {
+	model := strings.TrimSpace(record.Model)
+	if model == "" {
+		return ""
+	}
+	provider, ok := instanceProviders[record.Instance]
+	if !ok || provider == "" {
+		return model
+	}
+	return clientModelFor(provider, model)
 }
 
 const tokensPerMillion = 1_000_000.0
@@ -1327,6 +1653,24 @@ func (s *Server) summary(instance Instance) Summary {
 	out.ContainerID = instance.ContainerID
 	s.mu.RLock()
 	upstreamKey := s.upstreamKeys[instance.Name]
+	out.UpstreamKeyID = instance.UpstreamKeyID
+	out.UpstreamKeyIDs = append([]string(nil), instance.UpstreamKeyIDs...)
+	keyIDs := instance.UpstreamKeyIDs
+	if len(keyIDs) == 0 && instance.UpstreamKeyID != "" {
+		keyIDs = []string{instance.UpstreamKeyID}
+	}
+	labels := make([]string, 0, len(keyIDs))
+	for _, record := range s.providerKeys {
+		for _, id := range keyIDs {
+			if record.ID == id {
+				if upstreamKey == "" {
+					upstreamKey = record.Secret
+				}
+				labels = append(labels, record.Label)
+			}
+		}
+	}
+	out.UpstreamKeyLabel = strings.Join(labels, " + ")
 	out.UpstreamKeyMasked = maskAPIKey(upstreamKey)
 	out.UpstreamKeySet = upstreamKey != ""
 	out.AuthMode = providerAuthModeForKey(upstreamKey)
@@ -1354,6 +1698,9 @@ func (s *Server) summary(instance Instance) Summary {
 				slot["mihomo_node"] = group.Now
 			}
 		}
+	}
+	if instance.Provider == ProviderFreeBuff {
+		s.annotateFreeBuffEgress(out.Slots)
 	}
 	return out
 }

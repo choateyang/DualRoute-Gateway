@@ -44,3 +44,4 @@ services:
 networks:
   default:
     name: dualroute-gateway-network
+    external: true

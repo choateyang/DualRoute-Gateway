@@ -54,6 +54,7 @@ var (
 const (
 	maxModelCooldownsPerSlot = 256
 	maxBufferedResponseBytes = 32 << 20
+	instanceHealthyHeader    = "X-DualRoute-Instance-Healthy"
 )
 
 func (s *proxySlot) identity() string {
@@ -158,22 +159,37 @@ type Stats struct {
 	Errors      atomic.Uint64
 }
 type Gateway struct {
-	cfg     Config
-	client  *http.Client
-	slotsMu sync.RWMutex
-	slots   []*proxySlot
-	base    []*proxySlot
-	sem     chan struct{}
-	queue   chan struct{}
-	active  atomic.Uint64
-	stats   Stats
-	log     *slog.Logger
-	keyMu   sync.RWMutex
-	keys    map[string]struct{}
-	auditMu sync.RWMutex
-	audits  []auditRecord
-	logsMu  sync.RWMutex
-	logs    []systemLog
+	cfg                Config
+	client             *http.Client
+	slotsMu            sync.RWMutex
+	slots              []*proxySlot
+	base               []*proxySlot
+	sem                chan struct{}
+	queue              chan struct{}
+	active             atomic.Uint64
+	stats              Stats
+	log                *slog.Logger
+	keyMu              sync.RWMutex
+	keys               map[string]struct{}
+	auditMu            sync.RWMutex
+	audits             []auditRecord
+	logsMu             sync.RWMutex
+	logs               []systemLog
+	freeBuffAccounts   []*freeBuffAccount
+	freeBuffAccountIdx atomic.Uint64
+	freeBuffModelMu    sync.RWMutex
+	freeBuffModels     map[string]freeBuffModelInfo
+	freeBuffModelsAt   time.Time
+}
+
+type freeBuffAccount struct {
+	token         string
+	mu            sync.Mutex
+	lastCall      time.Time
+	cooldownUntil time.Time
+	sessions      map[string]freeBuffSession
+	runs          map[string]freeBuffRun
+	behaviorAt    time.Time
 }
 
 type auditRecord struct {
@@ -221,7 +237,21 @@ type systemLog struct {
 }
 
 func New(cfg Config, logger *slog.Logger) (*Gateway, error) {
-	g := &Gateway{cfg: cfg, client: &http.Client{Timeout: cfg.RequestTimeout}, sem: make(chan struct{}, cfg.MaxConcurrency), queue: make(chan struct{}, cfg.MaxConcurrency+cfg.QueueSize), log: logger, keys: make(map[string]struct{})}
+	if cfg.UpstreamProvider == ProviderCline && strings.TrimSpace(cfg.ClineTaskID) == "" {
+		cfg.ClineTaskID = newUUID()
+	}
+	g := &Gateway{cfg: cfg, client: &http.Client{Timeout: cfg.RequestTimeout}, sem: make(chan struct{}, cfg.MaxConcurrency), queue: make(chan struct{}, cfg.MaxConcurrency+cfg.QueueSize), log: logger, keys: make(map[string]struct{}), freeBuffModels: make(map[string]freeBuffModelInfo)}
+	if cfg.UpstreamProvider == ProviderFreeBuff {
+		accounts := cfg.UpstreamAPIKeys
+		if len(accounts) == 0 && cfg.UpstreamAPIKey != "" {
+			accounts = split(cfg.UpstreamAPIKey)
+		}
+		for _, token := range accounts {
+			if token = strings.TrimSpace(token); token != "" {
+				g.freeBuffAccounts = append(g.freeBuffAccounts, &freeBuffAccount{token: token, sessions: make(map[string]freeBuffSession), runs: make(map[string]freeBuffRun)})
+			}
+		}
+	}
 	for _, key := range cfg.GatewayKeys {
 		g.keys[key] = struct{}{}
 	}
@@ -1008,15 +1038,26 @@ func newGatewayKey() (string, error) {
 func (g *Gateway) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("content-type", "application/json")
 	now := time.Now()
+	configured := false
 	for _, slot := range g.snapshotSlots() {
 		slot.mu.Lock()
-		healthy := !slot.disabled && !now.Before(slot.until) && (slot.url == "" || slot.egress != "")
+		usable := !slot.disabled && (slot.url == "" || slot.egress != "")
+		healthy := usable && !now.Before(slot.until)
 		slot.mu.Unlock()
+		configured = configured || usable
 		if healthy {
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, `{"status":"ok"}`)
 			return
 		}
+	}
+	if configured {
+		// Cooling is upstream state, not process health. Keep the instance in
+		// the control-plane pool so callers receive a retryable 429 instead of
+		// a misleading no_healthy_gateway_instances response.
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"cooling"}`)
+		return
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = io.WriteString(w, `{"status":"probing","error":"no_healthy_proxy_slot"}`)
@@ -1167,6 +1208,9 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	meta.RequestID = gatewayRequestID
 	r = r.WithContext(context.WithValue(r.Context(), auditMetadataKey{}, meta))
 	w.Header().Set("X-Gateway-Request-ID", gatewayRequestID)
+	if g.cfg.UpstreamProvider == ProviderFreeBuff {
+		return g.forwardFreeBuff(ctx, w, r, path, body, model, streaming)
+	}
 	baseResponseHeaders := w.Header().Clone()
 	target := upstreamTargetURL(g.cfg.UpstreamURL, path)
 	if r.URL.RawQuery != "" {
@@ -1176,6 +1220,15 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	for attempt := 0; attempt <= g.cfg.MaxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if g.cfg.UpstreamProvider == ProviderCline {
+			if slot, wait := g.selectSlotExcluding(model, tried); slot == nil && wait >= 0 {
+				retryAfter := max(1, int((wait+time.Second-1)/time.Second))
+				g.stats.Gateway429.Add(1)
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				http.Error(w, `{"error":"upstream_cooling"}`, http.StatusTooManyRequests)
+				return nil
+			}
 		}
 		slot, err := g.waitForSlotExcluding(ctx, model, tried)
 		if err != nil {
@@ -1196,6 +1249,9 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 		// The gateway can add SSE lifecycle events, so it must receive a body it
 		// can forward or transform without preserving a stale encoded length.
 		req.Header.Set("Accept-Encoding", "identity")
+		for _, header := range []string{"User-Agent", "HTTP-Referer", "X-Title", "X-OpenCode-Client", "X-OpenCode-Request", "X-IS-MULTIROOT", "X-CLIENT-TYPE", "X-CLIENT-VERSION", "X-PLATFORM", "X-PLATFORM-VERSION", "X-CORE-VERSION", "X-Task-ID"} {
+			req.Header.Del(header)
+		}
 		if g.cfg.UpstreamProvider == ProviderOpenCode {
 			req.Header.Set("User-Agent", opencodeUserAgent)
 			req.Header.Set("HTTP-Referer", opencodeReferer)
@@ -1204,10 +1260,17 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 			if req.Header.Get("X-OpenCode-Request") == "" {
 				req.Header.Set("X-OpenCode-Request", gatewayRequestID)
 			}
-		} else {
-			for _, header := range []string{"HTTP-Referer", "X-Title", "X-OpenCode-Client", "X-OpenCode-Request"} {
-				req.Header.Del(header)
-			}
+		} else if g.cfg.UpstreamProvider == ProviderCline {
+			req.Header.Set("User-Agent", "Cline/4.1.4")
+			req.Header.Set("HTTP-Referer", "https://cline.bot")
+			req.Header.Set("X-Title", "Cline")
+			req.Header.Set("X-IS-MULTIROOT", "false")
+			req.Header.Set("X-CLIENT-TYPE", "cline-cli")
+			req.Header.Set("X-CLIENT-VERSION", "4.1.4")
+			req.Header.Set("X-PLATFORM", "cli")
+			req.Header.Set("X-PLATFORM-VERSION", "4.1.4")
+			req.Header.Set("X-CORE-VERSION", "0.0.70")
+			req.Header.Set("X-Task-ID", newUUID())
 		}
 		if anthropicRequest {
 			// Use the configured upstream credential, never the client's gateway key.
@@ -1234,7 +1297,7 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 				resp.Header.Set("Retry-After", retryAfterHeader)
 			}
 			g.stats.Upstream429.Add(1)
-			if g.cfg.UpstreamProvider == ProviderOpenCode {
+			if g.cfg.UpstreamProvider == ProviderOpenCode || g.cfg.UpstreamProvider == ProviderCline {
 				// OpenCode public/free limits can be tied to the current egress.
 				// Cool only this slot so the next retry can use another IP.
 				slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
@@ -1252,14 +1315,42 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 				g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, retryAfterHeader)
 			}
 		} else if resp.StatusCode >= 500 {
+			data, readErr := readBufferedResponse(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				g.handleUpstreamBodyFailure(r, slot, model, readErr)
+				g.recordAudit(r, model, http.StatusBadGateway, slot, started, "gateway", attempt+1, "")
+				if attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) {
+					continue
+				}
+				http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
+				return fmt.Errorf("upstream response body: %w", readErr)
+			}
+			if g.cfg.UpstreamProvider == ProviderCline && isClineEmptyResponse(resp.StatusCode, data) {
+				// This is a completed Cline inference with no answer, not an exit or
+				// instance failure. Keeping the slot healthy prevents one empty model
+				// result from cascading into health-check 503s for later requests.
+				slot.success(model)
+				g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, "")
+				copyResponseHeaders(w.Header(), resp.Header)
+				setNoStoreResponseHeaders(w.Header())
+				w.Header().Set(instanceHealthyHeader, "true")
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(data)
+				return nil
+			}
 			retryAfterHeader := resp.Header.Get("Retry-After")
 			retryAfter := parseRetryAfter(retryAfterHeader)
 			slot.cooldown(g.cfg.CooldownBase, g.cfg.CooldownMax, retryAfter)
 			g.recordAudit(r, model, resp.StatusCode, slot, started, "upstream", attempt+1, retryAfterHeader)
 			if attempt < g.cfg.MaxRetries && g.hasUntriedSlot(model, tried) {
-				resp.Body.Close()
 				continue
 			}
+			copyResponseHeaders(w.Header(), resp.Header)
+			setNoStoreResponseHeaders(w.Header())
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(data)
+			return nil
 		}
 		defer resp.Body.Close()
 		if g.cfg.FreeModelsOnly && path == "/v1/models" && resp.StatusCode == http.StatusOK {
@@ -1287,6 +1378,15 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 				}
 				http.Error(w, `{"error":"upstream_unavailable"}`, http.StatusBadGateway)
 				return fmt.Errorf("upstream response body: %w", readErr)
+			}
+			if g.cfg.UpstreamProvider == ProviderCline && path == "/v1/chat/completions" && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+				var changed bool
+				data, changed = normalizeClineBufferedResponse(data)
+				if changed {
+					resp.Header.Del("Content-Length")
+					resp.Header.Del("Content-Encoding")
+					resp.Header.Set("Content-Type", "application/json")
+				}
 			}
 			copyResponseHeaders(w.Header(), resp.Header)
 			setNoStoreResponseHeaders(w.Header())
@@ -1368,6 +1468,17 @@ func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte,
 	}
 	changed := false
 	model, _ := payload["model"].(string)
+	if g.cfg.UpstreamProvider == ProviderFreeBuff {
+		if upstreamModel := g.freeBuffUpstreamModel(model); upstreamModel != model {
+			model = upstreamModel
+			payload["model"] = model
+			changed = true
+		}
+	} else if upstreamModel := stripClientModelAlias(g.cfg.UpstreamProvider, model); upstreamModel != model {
+		model = upstreamModel
+		payload["model"] = model
+		changed = true
+	}
 	if g.cfg.ForcedModel != "" && model != g.cfg.ForcedModel {
 		model = g.cfg.ForcedModel
 		payload["model"] = model
@@ -1385,8 +1496,25 @@ func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte,
 			changed = true
 		}
 	}
+	if g.cfg.UpstreamProvider == ProviderFreeBuff && path == "/v1/responses" {
+		converted, err := normalizeResponsesInput(payload)
+		if err != nil {
+			return body, err
+		}
+		if converted {
+			changed = true
+		}
+		if normalizeResponsesMessageIDs(payload) {
+			changed = true
+		}
+	}
 	if g.cfg.UpstreamProvider == ProviderTokenRouter && g.cfg.IsolateUpstreamState {
 		if isolateTokenRouterState(payload) {
+			changed = true
+		}
+	}
+	if g.cfg.UpstreamProvider == ProviderCline {
+		if clampOutputTokenBudget(path, payload, clineMaxOutputTokens) {
 			changed = true
 		}
 	}
@@ -1436,6 +1564,52 @@ func (g *Gateway) normalizeRequestBodyChecked(path string, body []byte) ([]byte,
 		return body, nil
 	}
 	return encoded, nil
+}
+
+func (g *Gateway) freeBuffUpstreamModel(model string) string {
+	model = strings.TrimSpace(model)
+	if !strings.HasPrefix(strings.ToLower(model), "freebuff/") {
+		return model
+	}
+	alias := model[len("FreeBuff/"):]
+	g.refreshFreeBuffModelMap()
+	g.freeBuffModelMu.RLock()
+	defer g.freeBuffModelMu.RUnlock()
+	for id := range g.freeBuffModels {
+		candidate := id
+		if index := strings.IndexByte(candidate, '/'); index >= 0 && index+1 < len(candidate) {
+			candidate = candidate[index+1:]
+		}
+		if candidate == alias {
+			return id
+		}
+	}
+	return alias
+}
+
+func stripClientModelAlias(provider, model string) string {
+	switch provider {
+	case ProviderTokenRouter:
+		if model == tokenRouterClientModel {
+			return tokenRouterModel
+		}
+	case ProviderOpenCode:
+		if upstream, ok := openCodeUpstreamModel(model); ok {
+			return upstream
+		}
+	case ProviderCline:
+		if model == clineClientModel {
+			return clineUpstreamModel
+		}
+		if strings.HasPrefix(strings.ToLower(model), "cline/") {
+			return model[len("cline/"):]
+		}
+	case ProviderFreeBuff:
+		if strings.HasPrefix(strings.ToLower(model), "freebuff/") {
+			return model[len("FreeBuff/"):]
+		}
+	}
+	return model
 }
 
 // TokenRouter is used as a stateless upstream by this gateway. Its optional
@@ -1804,6 +1978,110 @@ func raiseThinkingTokenBudget(path string, payload map[string]any, minimum int) 
 		changed = true
 	}
 	return changed
+}
+
+func clampOutputTokenBudget(path string, payload map[string]any, maximum int) bool {
+	keys := []string{"max_tokens", "max_completion_tokens"}
+	if path == "/v1/responses" {
+		keys = []string{"max_output_tokens"}
+	}
+	changed := false
+	for _, key := range keys {
+		if current, ok := payload[key].(float64); ok && current > float64(maximum) {
+			payload[key] = maximum
+			changed = true
+		}
+	}
+	return changed
+}
+
+func isClineEmptyResponse(status int, data []byte) bool {
+	if status != http.StatusInternalServerError {
+		return false
+	}
+	var payload struct {
+		Error   any  `json:"error"`
+		Success bool `json:"success"`
+	}
+	if json.Unmarshal(data, &payload) != nil || payload.Success {
+		return false
+	}
+	message := ""
+	switch value := payload.Error.(type) {
+	case string:
+		message = value
+	case map[string]any:
+		message, _ = value["message"].(string)
+	}
+	return strings.EqualFold(strings.TrimSpace(message), "empty response content")
+}
+
+func addReasoningContent(payload map[string]any, containerKey string) bool {
+	changed := false
+	choices, _ := payload["choices"].([]any)
+	for _, rawChoice := range choices {
+		choice, _ := rawChoice.(map[string]any)
+		container, _ := choice[containerKey].(map[string]any)
+		reasoning, _ := container["reasoning"].(string)
+		if reasoning != "" {
+			if _, exists := container["reasoning_content"]; !exists {
+				container["reasoning_content"] = reasoning
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func normalizeClineBufferedResponse(data []byte) ([]byte, bool) {
+	var payload map[string]any
+	if json.Unmarshal(data, &payload) != nil {
+		return data, false
+	}
+	changed := false
+	if success, _ := payload["success"].(bool); success {
+		if unwrapped, ok := payload["data"].(map[string]any); ok {
+			payload = unwrapped
+			changed = true
+		}
+	}
+	if addReasoningContent(payload, "message") {
+		changed = true
+	}
+	if !changed {
+		return data, false
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return data, false
+	}
+	return encoded, true
+}
+
+func normalizeClineSSELine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "data:") {
+		return line
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if data == "" || data == "[DONE]" {
+		return line
+	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(data), &payload) != nil || !addReasoningContent(payload, "delta") {
+		return line
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return line
+	}
+	ending := ""
+	if strings.HasSuffix(line, "\r\n") {
+		ending = "\r\n"
+	} else if strings.HasSuffix(line, "\n") {
+		ending = "\n"
+	}
+	return "data: " + string(encoded) + ending
 }
 
 func isDeepSeekFlashFree(model string) bool {
@@ -2681,6 +2959,9 @@ func copyStreamResponse(w http.ResponseWriter, src io.Reader, started time.Time,
 	}
 	for {
 		line, err := readLine()
+		if model == clineUpstreamModel {
+			line = normalizeClineSSELine(line)
+		}
 		// The terminal event header must travel with its reconstructed data
 		// payload. Forwarding the original header here would create two adjacent
 		// response.completed events when the next line is normalized below.
@@ -2885,7 +3166,10 @@ func parseTokenUsage(data []byte) tokenUsage {
 		} `json:"input_tokens_details"`
 	}
 	var payload struct {
-		Usage    usagePayload `json:"usage"`
+		Usage usagePayload `json:"usage"`
+		Data  struct {
+			Usage usagePayload `json:"usage"`
+		} `json:"data"`
 		Response struct {
 			Usage usagePayload `json:"usage"`
 		} `json:"response"`
@@ -2896,6 +3180,9 @@ func parseTokenUsage(data []byte) tokenUsage {
 	usage := payload.Usage
 	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
 		usage = payload.Response.Usage
+	}
+	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 {
+		usage = payload.Data.Usage
 	}
 	promptTokens := usage.PromptTokens
 	if promptTokens == 0 {

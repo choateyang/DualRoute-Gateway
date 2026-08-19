@@ -212,6 +212,7 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, upst
 		"UPSTREAM_URL=" + upstreamURLForProvider(instance.Provider),
 		"UPSTREAM_PROVIDER=" + instance.Provider,
 		"UPSTREAM_MODEL=" + upstreamModelForProvider(instance.Provider),
+		"CLINE_TASK_ID=" + instance.ClineTaskID,
 		"UPSTREAM_API_KEY=" + upstreamAPIKey,
 		"GATEWAY_KEYS=" + strings.Join(keys, ","),
 		"INSTANCE_ADMIN_TOKEN=" + cfg.InstanceToken,
@@ -236,12 +237,15 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, upst
 		"ISOLATE_UPSTREAM_STATE=" + env("ISOLATE_UPSTREAM_STATE", "true"),
 	}
 	labels := map[string]string{
-		managedLabel:                        "true",
-		"dualroute.gateway.name":            instance.Name,
-		"dualroute.gateway.proxy_urls":      strings.Join(instance.ProxyURLs, ","),
-		"dualroute.gateway.max_concurrency": strconv.Itoa(instance.MaxConcurrency),
-		"dualroute.gateway.queue_size":      strconv.Itoa(instance.QueueSize),
-		"dualroute.gateway.provider":        instance.Provider,
+		managedLabel:                         "true",
+		"dualroute.gateway.name":             instance.Name,
+		"dualroute.gateway.proxy_urls":       strings.Join(instance.ProxyURLs, ","),
+		"dualroute.gateway.max_concurrency":  strconv.Itoa(instance.MaxConcurrency),
+		"dualroute.gateway.queue_size":       strconv.Itoa(instance.QueueSize),
+		"dualroute.gateway.provider":         instance.Provider,
+		"dualroute.gateway.cline_task_id":    instance.ClineTaskID,
+		"dualroute.gateway.upstream_key_id":  instance.UpstreamKeyID,
+		"dualroute.gateway.upstream_key_ids": strings.Join(instance.UpstreamKeyIDs, ","),
 	}
 	payload := map[string]any{
 		"Image":        cfg.GatewayImage,
@@ -372,6 +376,7 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 		"UPSTREAM_URL":      upstreamURLForProvider(instance.Provider),
 		"UPSTREAM_PROVIDER": instance.Provider,
 		"UPSTREAM_MODEL":    upstreamModelForProvider(instance.Provider),
+		"CLINE_TASK_ID":     instance.ClineTaskID,
 		"UPSTREAM_API_KEY":  upstreamAPIKey,
 		"PROXY_URLS":        strings.Join(instance.ProxyURLs, ","), "DIRECT_ENABLED": strconv.FormatBool(direct),
 		"MAX_CONCURRENCY": strconv.Itoa(instance.MaxConcurrency), "QUEUE_SIZE": strconv.Itoa(instance.QueueSize), "DATA_DIR": "/data",
@@ -394,6 +399,9 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 	labels["dualroute.gateway.max_concurrency"] = strconv.Itoa(instance.MaxConcurrency)
 	labels["dualroute.gateway.queue_size"] = strconv.Itoa(instance.QueueSize)
 	labels["dualroute.gateway.provider"] = instance.Provider
+	labels["dualroute.gateway.cline_task_id"] = instance.ClineTaskID
+	labels["dualroute.gateway.upstream_key_id"] = instance.UpstreamKeyID
+	labels["dualroute.gateway.upstream_key_ids"] = strings.Join(instance.UpstreamKeyIDs, ",")
 	payload := map[string]any{"Image": original.Config.Image, "Env": environment, "Labels": labels, "ExposedPorts": original.Config.ExposedPorts,
 		"HostConfig": map[string]any{"NetworkMode": original.HostConfig.NetworkMode, "Binds": original.HostConfig.Binds, "ReadonlyRootfs": original.HostConfig.ReadonlyRootfs, "SecurityOpt": original.HostConfig.SecurityOpt, "Tmpfs": original.HostConfig.Tmpfs, "RestartPolicy": original.HostConfig.RestartPolicy}}
 	encoded, _ := json.Marshal(payload)
@@ -543,6 +551,9 @@ func (s *Server) discoverInstances() ([]Instance, error) {
 			MaxConcurrency: positiveInt(container.Labels["dualroute.gateway.max_concurrency"], 4),
 			QueueSize:      nonNegativeInt(container.Labels["dualroute.gateway.queue_size"], 8),
 			Provider:       providerOrDefault(container.Labels["dualroute.gateway.provider"]),
+			ClineTaskID:    container.Labels["dualroute.gateway.cline_task_id"],
+			UpstreamKeyID:  container.Labels["dualroute.gateway.upstream_key_id"],
+			UpstreamKeyIDs: split(container.Labels["dualroute.gateway.upstream_key_ids"]),
 		})
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].Name < instances[j].Name })
@@ -554,6 +565,12 @@ func providerOrDefault(provider string) string {
 	if provider == ProviderOpenCode {
 		return ProviderOpenCode
 	}
+	if provider == ProviderCline {
+		return ProviderCline
+	}
+	if provider == ProviderFreeBuff {
+		return ProviderFreeBuff
+	}
 	return ProviderTokenRouter
 }
 
@@ -561,12 +578,26 @@ func upstreamURLForProvider(provider string) string {
 	if providerOrDefault(provider) == ProviderOpenCode {
 		return openCodeAPIURL
 	}
+	if providerOrDefault(provider) == ProviderCline {
+		return clineAPIURL
+	}
+	if providerOrDefault(provider) == ProviderFreeBuff {
+		return freeBuffAPIURL
+	}
 	return defaultUpstreamURL
 }
 
 func upstreamModelForProvider(provider string) string {
 	if providerOrDefault(provider) == ProviderOpenCode {
-		return openCodeModel
+		// OpenCode supports multiple free models; preserve the client-selected model.
+		return ""
+	}
+	if providerOrDefault(provider) == ProviderCline {
+		// Cline selects the model in the client request; do not force an alias.
+		return ""
+	}
+	if providerOrDefault(provider) == ProviderFreeBuff {
+		return ""
 	}
 	return tokenRouterModel
 }

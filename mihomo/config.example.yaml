@@ -1,0 +1,14 @@
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: warning
+ipv6: true
+external-controller: 0.0.0.0:9090
+proxy-groups:
+  - name: GATEWAY
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,DIRECT

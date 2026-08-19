@@ -1,131 +1,125 @@
 # DualRoute Gateway
 
-一个可自托管的双上游 API 网关。控制台统一管理 TokenRouter 与 OpenCode 实例、上游 API Key、代理出口、Mihomo 订阅与请求审计；客户端只需访问一个 OpenAI 兼容 API 地址。
+DualRoute Gateway 是一个 Docker 部署的多上游 OpenAI 兼容 API 网关。它提供统一的 API 地址和管理控制台，用于管理实例、网关访问密钥、上游凭据、模型开关、Mihomo 出口、审计日志与用量统计。
 
-当前版本：**双上游版（2026-08-18）**
+当前版本：`1.2.1`
 
-> 上游可用性、额度与限流由 TokenRouter 决定。增加实例或出口不等于增加上游账户额度。
+## 支持的上游
 
-## 功能概览
+| 上游 | 客户端模型名 | 实际上游模型 |
+|---|---|---|
+| TokenRouter | `TokenRouter/deepseek-v4-pro` | `deepseek/deepseek-v4-pro-0813-free` |
+| OpenCode | `OpenCode/big-pickle` | `big-pickle` |
+| OpenCode | `OpenCode/deepseek-v4-flash` | `deepseek-v4-flash-free` |
+| OpenCode | `OpenCode/hy3` | `hy3-free` |
+| OpenCode | `OpenCode/laguna-s-2.1` | `laguna-s-2.1-free` |
+| OpenCode | `OpenCode/mimo-v2.5` | `mimo-v2.5-free` |
+| OpenCode | `OpenCode/nemotron-3-ultra` | `nemotron-3-ultra-free` |
+| OpenCode | `OpenCode/nemotron-3.5-lightning` | `nemotron-3.5-lightning-free` |
+| Cline | `cline/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` |
+| FreeBuff | `FreeBuff/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` |
+| FreeBuff | `FreeBuff/deepseek-v4-pro` | `deepseek/deepseek-v4-pro` |
 
-- 统一提供 `/v1/*` API，兼容 `/openai/v1/*`、`/anthropic/v1/*`、`/codex/v1/*`。
-- 控制台创建、设置、启动、停止、重启和删除网关实例。
-- 每个实例独立选择 TokenRouter 或 OpenCode，并设置其上游 API Key、并发、队列与 HTTP/HTTPS/SOCKS5 出口。
-- 一组网关访问密钥可访问全部已部署的上游；控制面按客户端请求的模型名选择对应实例。
-- TokenRouter 固定使用 `deepseek/deepseek-v4-pro-0813-free`，OpenCode 固定使用 `deepseek-v4-flash-free`。
-- 导入 Clash/Mihomo 订阅，将 VLESS、Trojan、Shadowsocks、VMess、Hysteria2 等节点转换为本地 SOCKS5 端口。
-- 实例固定使用当前健康出口；网络故障、响应截断、出口冲突或手动换线时切换出口；TokenRouter 429 冷却当前实例 Key 并由控制面选择其他实例。
-- 审计、日志和 Token 统计覆盖所有已转发接口路径（包括 `/v1/chat/completions`、`/v1/responses` 和模型查询），可按接口、实例、模型、脱敏调用密钥及流式状态筛选；支持首字耗时、Token 速度和 USD 费用展示。
-- `/v1/responses` 兼容 OpenAI Responses 请求；网关会按上游需要规范化函数工具、`tool_choice`、输入内容和流式生命周期。
-- 实例启动后通过 `/healthz` 预检，只有健康实例进入统一 API 流量池。
+FreeBuff 的其他动态模型也以 `FreeBuff/<短模型名>` 展示。例如 `mimo/mimo-v2.5` 会显示为 `FreeBuff/mimo-v2.5`。模型列表每 30 分钟从动态目录刷新一次；控制面只展示已启用上游可用的模型。
 
-### 控制台展示
+## 功能
 
-![实例与出口](./image/1.png)
+- 统一提供 `/v1`、`/openai/v1`、`/anthropic/v1` 与 `/codex/v1` 的兼容入口。
+- 一组网关访问密钥可调用所有已启用的上游模型。
+- 控制台可创建、配置、启停、重启和删除实例。
+- 上游凭据按提供方保存，密钥只在服务端持久化并在界面脱敏显示。
+- 新建和编辑实例时，使用密钥卡片选择已保存凭据；FreeBuff 支持同时勾选多个账号。
+- TokenRouter、OpenCode、Cline、FreeBuff 可同时加入流量池。
+- 支持 HTTP、HTTPS、SOCKS5 与 Mihomo 转换出口；同一上游实例不会重复分配同一出口。
+- FreeBuff 实例会标识出口国家；非美国出口仅提示更换，不会自动停用。
+- 支持 OpenAI Chat Completions 和 Responses；控制台提供审计、日志、Token 统计和模型开关。
 
-![Mihomo 协议转换](./image/2.png)
+## FreeBuff 多账号与会话
 
-![审计与日志](./image/3.png)
+在“上游密钥”中保存多个 FreeBuff token。创建或编辑 FreeBuff 实例时可同时选择多个账号。
 
-![API Token 统计](./image/4.png)
+- 每个账号独立维护串行锁、会话、agent run、广告行为节流和冷却状态。
+- 同一个账号一次只执行一条完整的 session/run/chat 生命周期，避免并发占用会话。
+- 优先复用同模型的有效会话；没有有效会话时才轮询其他可用账号。
+- 单个账号发生 `429`、空响应或生命周期失败时只冷却该账号，后续请求会跳过它。
+- 网关只删除自身创建并记录的旧会话，不探测或删除其他客户端的会话。
 
-## 快速部署
+FreeBuff 的资格、会话额度、地区门控和可用模型均由上游决定。本项目不会承诺任何模型额度或可用性。
 
-需要 Docker Engine 或 Docker Desktop 与 Docker Compose v2。Linux 主机还需让控制面访问 `/var/run/docker.sock`。
+## 部署
+
+前置条件：Docker Engine 或 Docker Desktop，以及 Docker Compose v2。
 
 ```bash
 cp config.example.env .env
+docker network create dualroute-gateway-network
 docker compose up -d --build
 docker compose ps
 ```
 
-默认端口如下：
+Windows PowerShell：
+
+```powershell
+Copy-Item config.example.env .env
+docker network create dualroute-gateway-network
+docker compose up -d --build
+```
+
+默认地址：
 
 | 用途 | 地址 |
 |---|---|
 | 控制台 | `http://127.0.0.1:13338/` |
 | API | `http://127.0.0.1:13337/v1` |
-| 实例内部端口 | `13339`，无需对外暴露 |
 
-首次启动没有实例和访问密钥是正常状态。打开控制台，以默认账号 `admin`、密码 `admin` 登录；首次登录必须设置新密码。然后创建实例，选择上游、填写上游 API Key，并手动添加一组网关访问密钥。实例显示“在线”和“流量池”后即可调用。
+首次登录账号和密码均为 `admin`。登录后必须修改密码。默认没有实例、上游密钥或网关访问密钥，需由管理员在控制台手动添加。
 
-## API 调用
+若使用发布包，请将 `mihomo/config.example.yaml` 复制为 `mihomo/config.yaml` 后再启动。控制台保存 Mihomo 订阅时会生成运行配置；不要将实际订阅文件提交或分享。
+
+## 基本使用
+
+1. 登录控制台，在“上游密钥”中保存 TokenRouter、Cline 或 FreeBuff 密钥。
+2. 在“实例与出口”中创建实例，选择上游、密钥和候选出口。
+3. 在“模型管理”中确认所需模型已启用。
+4. 在“访问密钥”中添加一个网关密钥。
+5. 等待实例显示“在线”和“流量池”，再调用 API。
 
 ```bash
 curl --no-buffer http://127.0.0.1:13337/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek/deepseek-v4-pro-0813-free",
+    "model": "FreeBuff/deepseek-v4-pro",
     "messages": [{"role": "user", "content": "hello"}],
     "stream": true
   }'
 ```
 
-同一把 `GATEWAY_KEY` 支持以下固定模型：
+`GET /v1/models` 返回当前实例和模型开关允许的模型。客户端 Base URL 应指向 `/v1`，不要直接暴露或调用实例内部 `13339` 端口。
 
-| 客户端 `model` | 上游 |
-|---|---|
-| `deepseek/deepseek-v4-pro-0813-free` | TokenRouter |
-| `deepseek-v4-flash-free` | OpenCode |
+## FreeBuff Token 获取
 
-`GET /v1/models` 返回当前已部署实例可用的模型。Responses API 也根据请求体中的 `model` 选择上游。
+项目提供官方 CLI 授权流程的本地辅助脚本：
 
-OpenCode 的 `deepseek-v4-flash-free` 模型列表条目额外声明 `contextWindow: 1000000`、`supportsReasoningEffort`、`reasoningEffort` 和 `reasoningEfforts`，兼容 DSH 等客户端的推理等级选择器；默认值仍为 `none`。
+- Windows：双击 `get-freebuff-token.bat`
+- macOS：运行 `get-freebuff-token.command`
 
-客户端 Key 只用于访问网关；每个实例保存的上游 API Key 才用于访问上游。网关固定设置上游鉴权：
+脚本需要 Python 3，会在浏览器中打开授权页面，并将 token 写入本机的 `tools/freebuff/freebuff_token.txt`。该文件已被忽略，不在发布包中。请将 token 添加到控制台，不要公开、上传或提交该文件。
 
-```text
-Authorization: Bearer <TokenRouter API Key>
-```
+## 配置
 
-## Mihomo 与出口
+常用变量在 [config.example.env](./config.example.env) 中说明。
 
-在“Mihomo 协议转换”中保存服务商提供的 Clash/Mihomo HTTP(S) 订阅，然后点击“检测健康”。新建或设置实例时，选择带绿点的本地端口，例如：
-
-```text
-socks5h://mihomo:10801
-socks5h://mihomo:10802
-```
-
-`vless://`、`trojan://`、`ss://` 分享链接和 Cloudflare `IP:443` 不是实例代理地址，需先由 Mihomo 或其他客户端转换为 HTTP/SOCKS5 服务。
-
-普通请求会保持当前出口。网络错误、5xx、响应截断和重复公网出口会在实例内切换出口；TokenRouter 429 按“实例对应 Key + 模型”冷却全部出口，由控制面后续请求选择其他 Key。流式请求在 `STREAM_FIRST_OUTPUT_TIMEOUT` 内未出现文本、推理、工具调用或 Responses 完成事件时，会冷却当前出口并切换；已向客户端输出内容后不会中途重试，以免重复或拼接回复。
-
-## 常用配置
-
-| 变量 | 默认值 | 作用 |
+| 变量 | 默认值 | 说明 |
 |---|---:|---|
-| `INSTANCE_ADMIN_TOKEN` | 自动生成 | 可选的控制面到实例内部管理接口凭据，会保存在控制数据目录 |
-| `API_HOST_PORT` | `13337` | API 宿主机端口 |
 | `CONTROL_HOST_PORT` | `13338` | 控制台宿主机端口 |
+| `API_HOST_PORT` | `13337` | API 宿主机端口 |
 | `MAX_INSTANCES` | `16` | 实例数量上限 |
-| `MIHOMO_MAX_SLOTS` | `64` | Mihomo SOCKS5 槽位上限，最大 `128` |
-| `DIRECT_FALLBACK` | `false` | 存在代理实例时是否让直连实例参与分流 |
-| `FREE_MODELS_ONLY` | `false` | 保持 TokenRouter 模型名原样，不自动追加 `-free` |
-| `DISABLE_THINKING_BY_DEFAULT` | `false` | 保持客户端推理参数原样 |
-| `MIN_THINKING_MAX_TOKENS` | `0` | 不调整客户端输出预算 |
-| `ISOLATE_UPSTREAM_STATE` | `true` | TokenRouter 默认移除会话状态字段，避免复用上游 Worker/KV 状态 |
-| `MAX_RETRIES` | `2` | 上游 429、5xx 或首输出前断流后，最多额外尝试的不同出口数 |
-| `STREAM_FIRST_OUTPUT_TIMEOUT` | `20s` | 流式请求等待首个有效事件的最长时间；`0` 关闭 |
-| `STREAM_FAILURE_COOLDOWN` | `10m` | 首输出前断流或超时的出口对当前模型的最低冷却时间；`0` 关闭额外冷却 |
-
-完整变量说明见 [config.example.env](./config.example.env)。
-
-客户端传入的模型名由实例所属上游强制替换：TokenRouter 为 `deepseek/deepseek-v4-pro-0813-free`，OpenCode 为 `deepseek-v4-flash-free`。Responses `input` 与推理参数按上游兼容策略处理。
-
-实例设置接口使用通用字段 `upstream_api_key`、`auth_mode`；控制面保存的上游密钥位于 `data/control/upstream-keys.json`。升级时会自动读取上一版本的提供商密钥文件并迁移到新文件，已有实例无需重新录入。
-
-## 单域名反代
-
-宿主机 Nginx 按路径分流：
-
-```text
-/v1/、/openai/、/anthropic/、/codex/  -> 127.0.0.1:13337
-/、/api/、/static/                    -> 127.0.0.1:13338
-```
-
-客户端访问 `https://gateway.example.com/v1/chat/completions`。不要直接反代单个实例的 `13339`，否则会绕过统一鉴权、调度与审计。示例见 [host-single-domain.conf.example](./nginx/host-single-domain.conf.example)。
+| `MIHOMO_MAX_SLOTS` | `64` | Mihomo SOCKS5 槽位上限 |
+| `MAX_RETRIES` | `2` | 上游失败后的不同出口额外尝试次数 |
+| `REQUEST_TIMEOUT` | `5m` | 单个上游请求超时 |
+| `COOLDOWN_MAX` | `60s` | 出口或 FreeBuff 账号最低冷却依据 |
+| `ISOLATE_UPSTREAM_STATE` | `true` | TokenRouter 默认移除会话状态字段 |
 
 ## 升级与排错
 
@@ -136,32 +130,22 @@ docker compose logs --tail=100 mihomo
 docker ps -a --filter label=dualroute.gateway.managed=true
 ```
 
-控制面升级后，动态实例不会自动替换。逐个打开实例设置并保存，即可使用新网关镜像。
+控制面更新不会自动替换已有动态实例。打开实例设置并保存后，该实例会使用新镜像。
 
-| 现象 | 优先检查 |
-|---|---|
-| 创建实例返回 `502` | Docker Socket、镜像、Mihomo 健康节点、实例日志 |
-| 模型返回 `429` | 审计中的 `upstream429`、模型冷却、TokenRouter Key 与上游额度 |
-| `gateway_overloaded` | 实例并发、队列容量、当前请求量 |
-| `unexpected EOF` | 当前出口或节点提前断开；网关会冷却并在可安全重试时切换候选出口 |
-| `/v1/responses` 返回 `405` | 该接口仅接受 `POST`；客户端 Base URL 应为 `https://域名/v1` |
-| 长流式首字前返回 `502` | 当前出口首输出前断流或超时；审计会记录失败出口并自动尝试其余健康出口 |
-| 长请求约 125 秒后返回 Cloudflare `524` | Cloudflare 代理读取超时先于模型完成；缩短任务、关闭推理、拆分请求，或让 API 域名绕过 Cloudflare 代理 |
-| 控制台样式旧 | 重建控制面容器并清理 Nginx/CDN 静态缓存 |
+## 安全与发布包
 
-DualRoute Gateway 不依赖外部更新检查；升级时替换镜像并保留 `data/control` 与 Mihomo 配置即可。
+`data/`、`.env`、Mihomo 实际订阅、FreeBuff token、Docker 容器、审计日志和本地构建产物都属于私有运行数据。发布包不包含这些内容。
 
-## 安全
-
-Docker Socket 具有宿主机管理权限，只应向可信管理员开放控制台。生产环境应配置 TLS、管理员认证、IP 白名单和外部限流。不要提交或公开 `.env`、`data/`、订阅地址、TokenRouter API Key、客户端 Key 与管理员 Token。
+控制面需要访问 Docker Socket 来创建和管理实例。只应向可信管理员开放控制台；生产环境应配置 TLS、反向代理、IP 白名单和外部限流。
 
 ## 致谢
 
-感谢以下项目在接口兼容、代理出口和控制台架构调研中提供的参考：
+感谢以下项目提供的参考与灵感：
 
 - [spfnas/opencode2api-free](https://github.com/spfnas/opencode2api-free)
 - [GuJi08233/opencode-free-gate](https://github.com/GuJi08233/opencode-free-gate)
 - [ouqiting/ds2api](https://github.com/ouqiting/ds2api)
 - [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel)
+- [pingmike2/freebuff2api-wokers](https://github.com/pingmike2/freebuff2api-wokers)，为 FreeBuff 生命周期、动态模型目录和兼容策略提供了重要参考。
 
-使用这些项目或其衍生代码时，请遵守各自许可证与服务条款。
+使用参考项目或其衍生代码时，请遵守各自许可证与服务条款。

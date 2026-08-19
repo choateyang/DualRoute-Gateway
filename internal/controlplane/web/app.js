@@ -1,4 +1,4 @@
-const APP_VERSION = '1.1.7';
+const APP_VERSION = '1.2.1';
 const PAGE = document.body.dataset.page;
 const $ = id => document.getElementById(id);
 const esc = value => String(value || '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -13,7 +13,9 @@ const api = async (path, options = {}) => {
   return data;
 };
 const PAGE_META = {
-  instances: ['GATEWAY FLEET / OPERATIONS', '集中查看双上游实例、出口和流量池状态。'],
+  instances: ['GATEWAY FLEET / OPERATIONS', '集中查看四类上游实例、出口和流量池状态。'],
+  upstreams: ['UPSTREAM ACCESS / CREDENTIALS', '按上游集中保存实例使用的访问密钥。'],
+  models: ['MODEL CATALOG / AVAILABILITY', '控制客户端可见的上游和模型。'],
   mihomo: ['PROXY CONVERSION / MIHOMO', '管理订阅节点、健康状态和可分配的 SOCKS5 出口。'],
   keys: ['ACCESS CONTROL / API KEYS', '一组访问密钥可访问所有已部署上游模型。'],
   logs: ['OBSERVABILITY / ACTIVITY', '查看控制面、Mihomo 和实例运行事件。'],
@@ -22,6 +24,7 @@ const PAGE_META = {
 let state = {};
 let mihomoPage = 0;
 let selectedLogSource = 'control';
+const providerName = value => ({ tokenrouter: 'TokenRouter', opencode: 'OpenCode', cline: 'Cline', freebuff: 'FreeBuff' }[value] || value);
 
 function timeStamp() { $('updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN'); }
 function activeSlots(instance) {
@@ -32,6 +35,13 @@ function activeSlots(instance) {
   return healthy.length ? healthy.slice(0, 1) : slots.slice(0, 1);
 }
 function statusBadge(value, good) { return '<span class="badge ' + (good ? 'ok' : 'wait') + '">' + esc(value) + '</span>'; }
+function freeBuffGeoBadge(instance, slot) {
+  if (instance.provider !== 'freebuff' || !slot.egress) return '';
+  const status = slot.egress_country_status;
+  if (status === 'us') return ' <span class="badge ok" title="FreeBuff 建议使用美国出口">美国出口</span>';
+  if (status === 'non_us') return ' <span class="badge bad" title="FreeBuff 可能受地区限制，请更换美国出口">建议更换美国出口</span>';
+  return ' <span class="badge wait" title="暂时无法确认出口国家">国家未知，建议确认</span>';
+}
 function compactKey(value) {
   value = String(value || '');
   return value.length > 16 ? value.slice(0, 6) + '...' + value.slice(-4) : value;
@@ -55,25 +65,44 @@ function renderInstances() {
   const egressOwners = new Map();
   instances.forEach(item => activeSlots(item).forEach(slot => { if (slot.egress) { const ownerKey = (item.provider || 'tokenrouter') + '|' + slot.egress; egressOwners.set(ownerKey, [...(egressOwners.get(ownerKey) || []), item.instance]); } }));
   $('fleet').innerHTML = instances.map(item => {
-    const provider = item.provider === 'opencode' ? 'OpenCode' : 'TokenRouter';
+    const provider = providerName(item.provider || 'tokenrouter');
     const exits = activeSlots(item).map(slot => {
       const value = esc(slot.egress || (slot.direct ? '直连（未探测）' : '代理未探测'));
-      const node = slot.mihomo_node ? '<small class="muted" style="display:block;margin-top:4px">' + esc(slot.mihomo_node) + ' → ' + value + '</small>' : value;
+      const geoBadge = freeBuffGeoBadge(item, slot);
+      const node = slot.mihomo_node ? '<small class="muted" style="display:block;margin-top:4px">' + esc(slot.mihomo_node) + ' → ' + value + geoBadge + '</small>' : value + geoBadge;
       const duplicate = slot.egress && (egressOwners.get((item.provider || 'tokenrouter') + '|' + slot.egress) || []).length > 1;
       const cooldowns = (slot.model_cooldowns || []).map(item => '<span class="badge wait" title="恢复时间 ' + esc(item.ready_at || '') + '">' + esc(item.model || '模型') + ' 冷却</span>').join(' ');
       return node + (duplicate ? ' <span class="badge wait" title="重复出口，控制面会自动切换">重复出口</span>' : '') + (cooldowns ? ' ' + cooldowns : '') + (item.slots && item.slots.length > 1 ? ' <span class="badge pool" title="仅在 429 或故障时切换">' + item.slots.length + ' 个候选</span>' : '');
     }).join(', ') || '-';
-    const maskedKey = item.provider === 'opencode' && item.auth_mode === 'public' ? 'public（公共 Key）' : compactKey(item.upstream_api_key_masked || '未设置');
+    const maskedKey = item.provider === 'opencode' && item.auth_mode === 'public' ? '公共访问' : (item.upstream_key_label || compactKey(item.upstream_api_key_masked || '未设置'));
     return '<tr><td><strong>' + esc(item.instance) + '</strong><small class="mono muted">' + esc((item.container_id || '').slice(0, 12) || '-') + '</small></td><td>' + statusBadge(item.online ? '在线' : (item.status || '停止'), item.online) + ' ' + statusBadge(item.in_traffic_pool ? '流量池' : '未接入', item.in_traffic_pool) + '</td><td>' + statusBadge(provider, item.provider !== 'opencode') + '</td><td class="mono" title="' + esc(item.upstream_api_key_masked || '') + '">' + esc(maskedKey) + '</td><td>' + (Number(item.max_concurrency) || 0) + '</td><td class="mono">' + exits + '</td><td>' + instanceActions(item) + '</td></tr>';
   }).join('') || '<tr><td colspan="7">暂无实例，请新建实例并设置上游 API Key。</td></tr>';
 }
-function syncAuthMode(form) {
+function selectedProviderKeyIDs(form) {
+  return [...form.querySelectorAll('[data-provider-key-option][aria-pressed="true"]')].map(button => button.dataset.keyId).filter(Boolean);
+}
+function setProviderKeyIDs(form, ids) {
+  const selected = new Set(ids || []);
+  form.querySelectorAll('[data-provider-key-option]').forEach(button => {
+    const active = selected.has(button.dataset.keyId);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.classList.toggle('selected', active);
+  });
+  form.elements.upstream_key_id.value = [...selected][0] || '';
+}
+function syncProviderKey(form, requestedIDs) {
   const openCode = form.elements.provider.value === 'opencode';
-  const publicAccess = openCode && form.elements.auth_mode.value === 'public';
-  form.querySelectorAll('[data-auth-mode]').forEach(node => { node.hidden = !openCode; });
-  if (!openCode) form.elements.auth_mode.value = 'custom';
-  form.querySelectorAll('[data-custom-key]').forEach(node => { node.hidden = publicAccess; });
-  form.elements.upstream_api_key.required = form.id === 'createForm' && !publicAccess;
+  const provider = form.elements.provider.value;
+  const selected = requestedIDs || selectedProviderKeyIDs(form);
+  const keys = (state.providerKeys || []).filter(item => item.provider === provider);
+  const multiple = provider === 'freebuff';
+  const choices = form.querySelector('[data-provider-key-options]');
+  const selectedIDs = new Set(selected);
+  choices.innerHTML = keys.length ? keys.map(item => '<button type="button" class="provider-key-choice" data-provider-key-option data-key-id="' + esc(item.id) + '" aria-pressed="' + (selectedIDs.has(item.id) ? 'true' : 'false') + '" title="' + esc(item.secret_masked || '') + '"><span class="key-choice-indicator" aria-hidden="true"></span><span class="provider-key-choice-text"><strong>' + esc(item.label) + '</strong><small>' + esc(item.secret_masked || '-') + '</small></span></button>').join('') : '<p class="empty-inline">该上游尚未保存密钥</p>';
+  setProviderKeyIDs(form, selected);
+  form.querySelector('[data-provider-key-title]').textContent = multiple ? '上游密钥（可多选）' : '上游密钥';
+  form.querySelectorAll('[data-provider-key]').forEach(node => { node.hidden = openCode; });
+  form.querySelectorAll('[data-public-access]').forEach(node => { node.hidden = !openCode; });
 }
 function syncMihomoCandidateText(form) {
   const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices');
@@ -128,16 +157,34 @@ function resetCreateForm() {
   if (!form) return;
   form.reset();
   form.elements.provider.value = 'tokenrouter';
-  form.elements.auth_mode.value = 'custom';
-  form.elements.upstream_api_key.value = '';
   form.elements.proxy_urls.value = '';
   form.elements.max_concurrency.value = '4';
   form.elements.queue_size.value = '8';
-  syncAuthMode(form);
+  syncProviderKey(form, []);
   const choices = $('createMihomoChoices');
   if (choices) choices.innerHTML = '<span class="muted">正在读取订阅出口...</span>';
 }
-async function loadInstances() { state = await api('/overview'); renderInstances(); }
+async function loadInstances() {
+  const results = await Promise.all([api('/overview'), api('/provider-keys')]);
+  state = results[0]; state.providerKeys = results[1].keys || [];
+  renderInstances();
+}
+
+function renderProviderKeys() {
+  const keys = state.providerKeys || [];
+  const providers = ['tokenrouter', 'cline', 'freebuff'];
+  $('providerKeyGroups').innerHTML = providers.map(provider => {
+    const records = keys.filter(item => item.provider === provider);
+    return '<section class="provider-group"><div class="provider-group-head"><div><strong>' + providerName(provider) + '</strong><small>' + records.length + ' 个已保存密钥</small></div></div><div class="provider-key-list">' + (records.map(item => '<div class="provider-key"><div><strong>' + esc(item.label) + '</strong><code>' + esc(item.secret_masked || '-') + '</code></div><button class="icon-button danger provider-key-delete" data-id="' + esc(item.id) + '" title="删除密钥">×</button></div>').join('') || '<p class="empty-inline">尚未保存密钥</p>') + '</div></section>';
+  }).join('');
+}
+async function loadProviderKeys() { const result = await api('/provider-keys'); state.providerKeys = result.keys || []; renderProviderKeys(); }
+
+function renderModels(result) {
+  const providers = result.providers || [];
+  $('modelGroups').innerHTML = providers.map(provider => '<section class="model-provider ' + (provider.enabled ? '' : 'disabled') + '"><div class="model-provider-head"><div><strong>' + esc(provider.name) + '</strong><small>' + (provider.models || []).filter(item => item.enabled).length + ' / ' + (provider.models || []).length + ' 个模型启用</small></div><label class="switch"><input class="provider-toggle" type="checkbox" data-provider="' + esc(provider.id) + '"' + (provider.enabled ? ' checked' : '') + '><span></span><b>' + (provider.enabled ? '已启用' : '已关闭') + '</b></label></div><div class="model-list">' + (provider.models || []).map(model => '<div class="model-row"><div><code>' + esc(model.client_model) + '</code><small>上游模型：' + esc(model.id) + '</small></div><label class="switch"><input class="model-toggle" type="checkbox" data-provider="' + esc(provider.id) + '" data-model="' + esc(model.id) + '"' + (model.enabled ? ' checked' : '') + (provider.enabled ? '' : ' disabled') + '><span></span><b>' + (model.enabled ? '显示' : '隐藏') + '</b></label></div>').join('') + '</div></section>').join('');
+}
+async function loadModels() { renderModels(await api('/model-settings')); }
 function renderMihomo() {
   const endpoints = state.endpoints || [];
   const pageSize = 10;
@@ -203,7 +250,7 @@ function tokenQuery() {
   return query.toString() ? '/tokens?' + query.toString() : '/tokens';
 }
 function syncTokenFilters(records) {
-  [['tokenInstance', 'instance'], ['tokenPath', 'path'], ['tokenModel', 'model'], ['tokenKey', 'client_key']].forEach(pair => {
+  [['tokenInstance', 'instance'], ['tokenPath', 'path'], ['tokenModel', 'client_model'], ['tokenKey', 'client_key']].forEach(pair => {
     const select = $(pair[0]);
     const selected = select.value;
     const options = [...new Set(records.map(record => record[pair[1]]).filter(Boolean))].sort();
@@ -227,17 +274,20 @@ function renderTokens(data) {
   $('tokenCacheRate').textContent = cacheHitRate(summary.cached_tokens, summary.prompt_tokens);
   $('tokenCost').textContent = formatUSD(summary.total_cost_usd);
   $('tokenRows').innerHTML = records.map(record => {
+    const displayModel = record.client_model || record.model || '-';
     const success = Number(record.status) >= 200 && Number(record.status) < 400;
     const hasUsage = Number(record.total_tokens) || Number(record.prompt_tokens) || Number(record.completion_tokens) || Number(record.cached_tokens);
     const speed = outputSpeed(record);
     const firstToken = Number(record.first_token_ms) ? (Number(record.first_token_ms) / 1000).toFixed(1) + 's' : '-';
-    return '<tr><td><time>' + esc(record.at ? new Date(record.at).toLocaleTimeString('zh-CN') : '-') + '</time><small>' + esc(record.at ? new Date(record.at).toLocaleDateString('zh-CN') : '') + '</small></td><td><strong>' + esc(record.instance || '-') + '</strong><small class="mono">' + esc(record.egress || '出口未知') + '</small></td><td><code class="path-chip">' + esc(record.path || '-') + '</code></td><td><code class="key-chip">' + esc(record.client_key || '旧记录') + '</code></td><td><span class="model-chip" title="' + esc(record.model || '') + '">' + esc(record.model || '-') + '</span></td><td><span class="stream-state ' + (record.stream ? 'streaming' : '') + '">' + (record.stream ? '流' : '非流') + '</span><small>' + (speed || '-') + '</small></td><td class="usage-cell">' + (hasUsage ? '<strong>输入 ' + formatNumber(record.prompt_tokens) + ' / 输出 ' + formatNumber(record.completion_tokens) + '</strong><small>' + (Number(record.cached_tokens) ? '缓存 ' + formatNumber(record.cached_tokens) : '未命中缓存') + '</small>' : '<span class="muted">未返回用量</span>') + '</td><td>' + costDetails(record) + '</td><td><span class="status-chip ' + (success ? 'ok' : 'bad') + '">' + (Number(record.status) || '-') + '</span><small>' + esc(record.source || 'upstream') + (record.recovered ? ' · 已恢复' : '') + '</small></td><td class="latency-cell"><i class="' + (success ? 'ok' : 'bad') + '"></i><strong>首字 ' + firstToken + '</strong><small>耗时 ' + (Number(record.latency_ms) / 1000).toFixed(1) + 's · 第' + (Number(record.attempts) || 1) + '次</small></td></tr>';
+    return '<tr><td><time>' + esc(record.at ? new Date(record.at).toLocaleTimeString('zh-CN') : '-') + '</time><small>' + esc(record.at ? new Date(record.at).toLocaleDateString('zh-CN') : '') + '</small></td><td><strong>' + esc(record.instance || '-') + '</strong><small class="mono">' + esc(record.egress || '出口未知') + '</small></td><td><code class="path-chip">' + esc(record.path || '-') + '</code></td><td><code class="key-chip">' + esc(record.client_key || '旧记录') + '</code></td><td><span class="model-chip" title="' + esc(record.model || '') + '">' + esc(displayModel) + '</span></td><td><span class="stream-state ' + (record.stream ? 'streaming' : '') + '">' + (record.stream ? '流' : '非流') + '</span><small>' + (speed || '-') + '</small></td><td class="usage-cell">' + (hasUsage ? '<strong>输入 ' + formatNumber(record.prompt_tokens) + ' / 输出 ' + formatNumber(record.completion_tokens) + '</strong><small>' + (Number(record.cached_tokens) ? '缓存 ' + formatNumber(record.cached_tokens) : '未命中缓存') + '</small>' : '<span class="muted">未返回用量</span>') + '</td><td>' + costDetails(record) + '</td><td><span class="status-chip ' + (success ? 'ok' : 'bad') + '">' + (Number(record.status) || '-') + '</span><small>' + esc(record.source || 'upstream') + (record.recovered ? ' · 已恢复' : '') + '</small></td><td class="latency-cell"><i class="' + (success ? 'ok' : 'bad') + '"></i><strong>首字 ' + firstToken + '</strong><small>耗时 ' + (Number(record.latency_ms) / 1000).toFixed(1) + 's · 第' + (Number(record.attempts) || 1) + '次</small></td></tr>';
   }).join('') || '<tr><td colspan="10"><p class="empty-state">当前筛选条件下暂无接口统计记录</p></td></tr>';
 }
 async function loadTokens() { renderTokens(await api(tokenQuery())); }
 async function loadPage() {
   try {
     if (PAGE === 'instances') await loadInstances();
+    if (PAGE === 'upstreams') await loadProviderKeys();
+    if (PAGE === 'models') await loadModels();
     if (PAGE === 'mihomo') await loadMihomo();
     if (PAGE === 'keys') await loadKeys();
     if (PAGE === 'logs') await loadLogs();
@@ -247,11 +297,15 @@ async function loadPage() {
 }
 function bindPage() {
   if (PAGE === 'instances') {
-    ['createForm', 'settingsForm'].forEach(id => { const form = $(id); syncAuthMode(form); form.elements.provider.onchange = () => { syncAuthMode(form); loadMihomoCandidates(form); }; form.elements.auth_mode.onchange = () => syncAuthMode(form); form.elements.proxy_urls.addEventListener('input', () => { const selected = new Set(form.elements.proxy_urls.value.split(/\r?\n|,/).map(value => value.trim()).filter(Boolean)); const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices'); if (list) list.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = selected.has(input.value); }); }); });
+    ['createForm', 'settingsForm'].forEach(id => { const form = $(id); syncProviderKey(form, []); form.elements.provider.onchange = () => { syncProviderKey(form, []); loadMihomoCandidates(form); }; form.elements.proxy_urls.addEventListener('input', () => { const selected = new Set(form.elements.proxy_urls.value.split(/\r?\n|,/).map(value => value.trim()).filter(Boolean)); const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices'); if (list) list.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = selected.has(input.value); }); }); });
     $('openCreate').onclick = () => { resetCreateForm(); $('createDialog').showModal(); loadMihomoCandidates($('createForm')); };
     $('instanceProbe').onclick = loadPage;
     $('createForm').onsubmit = instanceSubmit('/instances', 'POST', 'createDialog');
     $('settingsForm').onsubmit = instanceSubmit('', 'PUT', 'settingsDialog');
+  }
+  if (PAGE === 'upstreams') {
+    $('newProviderKey').onclick = () => { $('providerKeyForm').reset(); $('providerKeyDialog').showModal(); };
+    $('providerKeyForm').onsubmit = async event => { if (event.submitter && event.submitter.value === 'cancel') return; event.preventDefault(); const data = new FormData(event.currentTarget); try { await api('/provider-keys', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: data.get('provider'), label: data.get('label').trim(), secret: data.get('secret').trim() }) }); $('providerKeyDialog').close(); loadPage(); } catch (error) { alert('保存失败：' + error.message); } };
   }
   if (PAGE === 'mihomo') {
     $('mihomoForm').onsubmit = async event => { event.preventDefault(); try { await api('/mihomo', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ subscription_url: new FormData(event.currentTarget).get('subscription_url').trim() }) }); loadPage(); } catch (error) { alert(error.message); } };
@@ -275,11 +329,32 @@ function instanceSubmit(path, method, dialog) {
     syncMihomoCandidateText(form);
     const data = new FormData(form);
     const target = path || '/instances/' + encodeURIComponent(data.get('name'));
-    const payload = { name: data.get('name').trim(), provider: data.get('provider'), auth_mode: data.get('auth_mode'), upstream_api_key: data.get('upstream_api_key').trim(), max_concurrency: Number(data.get('max_concurrency')), queue_size: Number(data.get('queue_size')), proxy_urls: data.get('proxy_urls').split(/\r?\n|,/).map(value => value.trim()).filter(Boolean) };
+    const upstreamKeyIDs = selectedProviderKeyIDs(form);
+    if (data.get('provider') !== 'opencode' && !upstreamKeyIDs.length) { alert('请选择至少一个上游密钥。'); return; }
+  const payload = { name: data.get('name').trim(), provider: data.get('provider'), upstream_key_id: upstreamKeyIDs[0] || '', upstream_key_ids: upstreamKeyIDs, max_concurrency: Number(data.get('max_concurrency')), queue_size: Number(data.get('queue_size')), proxy_urls: data.get('proxy_urls').split(/\r?\n|,/).map(value => value.trim()).filter(Boolean) };
     try { await api(target, { method: method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }); $(dialog).close(); loadPage(); } catch (error) { alert('保存失败：' + error.message); }
   };
 }
 document.addEventListener('click', async event => {
+  const providerKeyChoice = event.target.closest('[data-provider-key-option]');
+  if (providerKeyChoice) {
+    const form = providerKeyChoice.closest('form');
+    const multiple = form.elements.provider.value === 'freebuff';
+    const selected = new Set(selectedProviderKeyIDs(form));
+    if (multiple) {
+      if (selected.has(providerKeyChoice.dataset.keyId)) selected.delete(providerKeyChoice.dataset.keyId);
+      else selected.add(providerKeyChoice.dataset.keyId);
+    } else {
+      selected.clear();
+      selected.add(providerKeyChoice.dataset.keyId);
+    }
+    setProviderKeyIDs(form, [...selected]);
+    return;
+  }
+  const providerKeyDelete = event.target.closest('.provider-key-delete');
+  if (providerKeyDelete && confirm('删除这个上游密钥？正在使用的密钥不能删除。')) { try { await api('/provider-keys/' + encodeURIComponent(providerKeyDelete.dataset.id), { method: 'DELETE' }); loadPage(); } catch (error) { alert('删除失败：' + error.message); } return; }
+  const modelToggle = event.target.closest('.model-toggle, .provider-toggle');
+  if (modelToggle) { try { const result = await api('/model-settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: modelToggle.dataset.provider, model: modelToggle.dataset.model || '', enabled: modelToggle.checked }) }); renderModels(result); timeStamp(); } catch (error) { modelToggle.checked = !modelToggle.checked; alert('更新失败：' + error.message); } return; }
   const source = event.target.closest('.log-source');
   if (source) { selectedLogSource = source.dataset.source; renderLogs(); return; }
   const useMihomo = event.target.closest('.use-mihomo');
@@ -299,9 +374,10 @@ document.addEventListener('click', async event => {
     const item = (state.instances || []).find(instance => instance.instance === settings.dataset.name);
     if (!item) return;
     const form = $('settingsForm');
-    form.elements.name.value = item.instance; form.elements.provider.value = item.provider || 'tokenrouter'; form.elements.auth_mode.value = item.auth_mode || 'custom'; form.elements.upstream_api_key.value = ''; form.elements.proxy_urls.value = (item.proxy_urls || []).join('\n'); form.elements.max_concurrency.value = item.max_concurrency || 4; form.elements.queue_size.value = item.queue_size ?? 8;
-    $('settingsHint').textContent = item.instance + ' 当前上游 API Key：' + (item.upstream_api_key_masked || '未设置') + '；留空保持不变。';
-    syncAuthMode(form); $('settingsDialog').showModal(); loadMihomoCandidates(form); return;
+    form.elements.name.value = item.instance; form.elements.provider.value = item.provider || 'tokenrouter'; form.elements.proxy_urls.value = (item.proxy_urls || []).join('\n'); form.elements.max_concurrency.value = item.max_concurrency || 4; form.elements.queue_size.value = item.queue_size ?? 8;
+    syncProviderKey(form, item.upstream_key_ids || [item.upstream_key_id]);
+    $('settingsHint').textContent = item.instance + ' 当前密钥：' + (item.upstream_key_label || item.upstream_api_key_masked || '未设置') + '。';
+    $('settingsDialog').showModal(); loadMihomoCandidates(form); return;
   }
   const action = event.target.closest('.instance-action');
   if (action) { try { await api('/instances/' + action.dataset.name + '/' + action.dataset.action, { method: 'POST' }); loadPage(); } catch (error) { alert('操作失败：' + error.message); } return; }

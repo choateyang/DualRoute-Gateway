@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -13,11 +15,20 @@ import (
 const (
 	ProviderTokenRouter = "tokenrouter"
 	ProviderOpenCode    = "opencode"
+	ProviderCline       = "cline"
+	ProviderFreeBuff    = "freebuff"
 
-	tokenRouterURL   = "https://api.tokenrouter.com/v1"
-	openCodeZenURL   = "https://opencode.ai/zen"
-	tokenRouterModel = "deepseek/deepseek-v4-pro-0813-free"
-	openCodeModel    = "deepseek-v4-flash-free"
+	tokenRouterURL         = "https://api.tokenrouter.com/v1"
+	openCodeZenURL         = "https://opencode.ai/zen"
+	clineAPIURL            = "https://api.cline.bot/api/v1"
+	freeBuffAPIURL         = "https://www.codebuff.com"
+	tokenRouterModel       = "deepseek/deepseek-v4-pro-0813-free"
+	openCodeModel          = "deepseek-v4-flash-free"
+	tokenRouterClientModel = "TokenRouter/deepseek-v4-pro"
+	openCodeClientModel    = "OpenCode/deepseek-v4-flash"
+	clineClientModel       = "cline/deepseek-v4-flash"
+	clineUpstreamModel     = "deepseek/deepseek-v4-flash"
+	clineMaxOutputTokens   = 4096
 
 	opencodeVersion   = "1.18.16"
 	opencodeUserAgent = "opencode/" + opencodeVersion
@@ -26,11 +37,23 @@ const (
 	opencodeTitle     = "opencode"
 )
 
+var openCodeModels = []string{
+	"big-pickle",
+	"deepseek-v4-flash-free",
+	"hy3-free",
+	"laguna-s-2.1-free",
+	"mimo-v2.5-free",
+	"nemotron-3-ultra-free",
+	"nemotron-3.5-lightning-free",
+}
+
 type Config struct {
 	ListenAddr               string
 	UpstreamProvider         string
 	UpstreamURL              string
 	UpstreamAPIKey           string
+	UpstreamAPIKeys          []string
+	ClineTaskID              string
 	ForcedModel              string
 	GatewayKeys              []string
 	ProxyURLs                []string
@@ -86,6 +109,13 @@ func LoadConfig() (Config, error) {
 		c.UpstreamURL = strings.TrimRight(v, "/")
 	}
 	c.UpstreamAPIKey = strings.TrimSpace(os.Getenv("UPSTREAM_API_KEY"))
+	if c.UpstreamProvider == ProviderFreeBuff {
+		c.UpstreamAPIKeys = split(c.UpstreamAPIKey)
+		if len(c.UpstreamAPIKeys) > 0 {
+			c.UpstreamAPIKey = c.UpstreamAPIKeys[0]
+		}
+	}
+	c.ClineTaskID = strings.TrimSpace(os.Getenv("CLINE_TASK_ID"))
 	if v := os.Getenv("GATEWAY_KEYS"); v != "" {
 		c.GatewayKeys = split(v)
 	}
@@ -208,8 +238,17 @@ func LoadConfig() (Config, error) {
 	if c.UpstreamAPIKey == "" {
 		return c, fmt.Errorf("UPSTREAM_API_KEY is required")
 	}
-	if len(c.UpstreamAPIKey) > 512 || strings.IndexFunc(c.UpstreamAPIKey, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return c, fmt.Errorf("UPSTREAM_API_KEY is invalid")
+	if c.UpstreamProvider == ProviderCline && c.ClineTaskID == "" {
+		c.ClineTaskID = newUUID()
+	}
+	keys := c.UpstreamAPIKeys
+	if len(keys) == 0 {
+		keys = []string{c.UpstreamAPIKey}
+	}
+	for _, key := range keys {
+		if len(key) > 512 || strings.IndexFunc(key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return c, fmt.Errorf("UPSTREAM_API_KEY is invalid")
+		}
 	}
 	if c.MaxConcurrency < 1 || c.QueueSize < 0 || c.MaxRetries < 0 || c.MinThinkingMaxTokens < 0 || c.CooldownBase <= 0 || c.CooldownMax < c.CooldownBase {
 		return c, fmt.Errorf("invalid concurrency/retry/cooldown settings")
@@ -241,14 +280,36 @@ func applyProviderDefaults(c *Config) error {
 		c.MinThinkingMaxTokens = 0
 	case ProviderOpenCode:
 		c.UpstreamURL = openCodeZenURL
-		c.ForcedModel = openCodeModel
+		c.ForcedModel = ""
 		c.FreeModelsOnly = true
 		c.DisableThinkingByDefault = true
 		c.MinThinkingMaxTokens = 8192
+	case ProviderCline:
+		c.UpstreamURL = clineAPIURL
+		c.ForcedModel = ""
+		c.FreeModelsOnly = false
+		c.DisableThinkingByDefault = false
+		c.MinThinkingMaxTokens = 0
+	case ProviderFreeBuff:
+		c.UpstreamURL = freeBuffAPIURL
+		c.ForcedModel = ""
+		c.FreeModelsOnly = false
+		c.DisableThinkingByDefault = false
+		c.MinThinkingMaxTokens = 0
 	default:
-		return fmt.Errorf("UPSTREAM_PROVIDER must be %q or %q", ProviderTokenRouter, ProviderOpenCode)
+		return fmt.Errorf("UPSTREAM_PROVIDER must be %q, %q, %q, or %q", ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff)
 	}
 	return nil
+}
+
+func openCodeUpstreamModel(model string) (string, bool) {
+	model = strings.TrimSpace(model)
+	for _, upstream := range openCodeModels {
+		if model == upstream || model == "OpenCode/"+strings.TrimSuffix(upstream, "-free") {
+			return upstream, true
+		}
+	}
+	return "", false
 }
 
 func split(v string) []string {
@@ -260,6 +321,18 @@ func split(v string) []string {
 	}
 	return out
 }
+
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		n := uint64(time.Now().UnixNano())
+		return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x", n>>32, n>>16&0xffff, n&0x0fff, n>>12&0x0fff, n&0xffffffffffff)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]), hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
+}
+
 func positiveInt(v string, fallback int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 {
