@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,14 +47,18 @@ const (
 	clineUpstreamModel     = "deepseek/deepseek-v4-flash"
 )
 
+// Keep in sync with the free tier of https://opencode.ai/zen/v1/models.
+// Only keyless free models belong here; paid models require upstream keys.
 var openCodeModels = []string{
 	"big-pickle",
 	"deepseek-v4-flash-free",
 	"hy3-free",
 	"laguna-s-2.1-free",
 	"mimo-v2.5-free",
+	"muse-spark-1.2-contributor-free",
 	"nemotron-3-ultra-free",
 	"nemotron-3.5-lightning-free",
+	"x-preview-f-free",
 }
 
 const (
@@ -60,7 +66,11 @@ const (
 	providerAuthModeCustom = "custom"
 )
 
-const maxAPIRequestBodyBytes = 16 << 20
+const (
+	maxAPIRequestBodyBytes = 16 << 20
+	maxClineModels         = 128
+	maxClineModelLength    = 160
+)
 
 const instanceHealthyHeader = "X-DualRoute-Instance-Healthy"
 
@@ -81,6 +91,10 @@ type Config struct {
 	MihomoAPIURL    string
 	MihomoMaxSlots  int
 	MaxInstances    int
+	// Optional HTTP(S) proxy used only to refresh the FreeBuff model catalog.
+	FreeBuffModelsProxy string
+	// Ordered, trusted GitHub release URLs for the FreeBuff model catalog.
+	FreeBuffModelsURLs []string
 	// BootstrapKeys remains for programmatic migrations. New deployments start
 	// with no gateway keys and add them through the control plane.
 	BootstrapKeys []string
@@ -102,37 +116,48 @@ type Instance struct {
 	UpstreamKeyIDs []string `json:"upstream_key_ids,omitempty"`
 }
 type Server struct {
-	cfg              Config
-	client           *http.Client
-	mu               sync.RWMutex
-	lifecycleMu      sync.Mutex
-	rotationMu       sync.Mutex
-	keys             []string
-	upstreamKeys     map[string]string
-	instances        []Instance
-	rotationLogs     []SystemLog
-	rotationFailures map[string]string
-	lastUpstream429  map[string]uint64
-	clineModelsMu    sync.RWMutex
-	clineModels      map[string]struct{}
-	providerModelsMu sync.RWMutex
-	freeBuffModels   []string
-	freeBuffModelsAt time.Time
-	geoIPMu          sync.Mutex
-	geoIPCache       map[string]geoIPResult
-	geoIPClient      *http.Client
-	geoIPBaseURL     string
-	providerKeys     []ProviderKey
-	modelSettings    ModelSettings
-	docker           *dockerClient
-	apiMu            sync.Mutex
-	apiInflight      map[string]int
-	apiCircuits      map[string]apiCircuit
-	apiReadiness     map[string]apiReadiness
-	apiCursor        atomic.Uint64
-	authMu           sync.Mutex
-	auth             adminCredential
-	sessions         map[string]session
+	cfg                      Config
+	client                   *http.Client
+	mu                       sync.RWMutex
+	lifecycleMu              sync.Mutex
+	rotationMu               sync.Mutex
+	keys                     []string
+	upstreamKeys             map[string]string
+	instances                []Instance
+	rotationLogs             []SystemLog
+	rotationFailures         map[string]string
+	lastUpstream429          map[string]uint64
+	clineModelsMu            sync.RWMutex
+	clineModels              map[string]struct{}
+	providerModelsMu         sync.RWMutex
+	freeBuffModels           []string
+	freeBuffModelsAt         time.Time
+	freeBuffModelsRetryAt    time.Time
+	freeBuffModelsRefreshing bool
+	freeBuffModelsClient     *http.Client
+	freeBuffModelsURLs       []string
+	openCodeModelsMu         sync.RWMutex
+	openCodeDynamicModels    []string
+	openCodeModelsAt         time.Time
+	openCodeModelsRetryAt    time.Time
+	openCodeModelsRefreshing bool
+	geoIPMu                  sync.Mutex
+	geoIPCache               map[string]geoIPResult
+	geoIPClient              *http.Client
+	geoIPBaseURL             string
+	providerKeys             []ProviderKey
+	modelSettings            ModelSettings
+	docker                   *dockerClient
+	apiMu                    sync.Mutex
+	apiInflight              map[string]int
+	apiCircuits              map[string]apiCircuit
+	apiReadiness             map[string]apiReadiness
+	apiCursor                atomic.Uint64
+	authMu                   sync.Mutex
+	auth                     adminCredential
+	sessions                 map[string]session
+	loginMu                  sync.Mutex
+	loginAttempts            map[string]loginAttempt
 }
 
 type GatewayKey struct {
@@ -148,6 +173,10 @@ type apiReadiness struct {
 	Healthy bool
 	Until   time.Time
 }
+
+var clineModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$`)
+
+var openCodeModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$`)
 
 type observedResponseBody struct {
 	io.ReadCloser
@@ -254,7 +283,22 @@ type instanceRequest struct {
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{ListenAddr: env("CONTROL_LISTEN_ADDR", "0.0.0.0:13338"), APIListenAddr: env("API_LISTEN_ADDR", "0.0.0.0:13337"), InstanceToken: os.Getenv("INSTANCE_ADMIN_TOKEN"), DataDir: env("CONTROL_DATA_DIR", "/control-data"), DockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"), DockerNetwork: env("GATEWAY_NETWORK", "dualroute-gateway_default"), GatewayImage: env("GATEWAY_IMAGE", "dualroute-gateway-gateway:latest"), DirectFallback: compatibleBoolEnv("DIRECT_FALLBACK", "NGINX_DIRECT_FALLBACK", false), MihomoContainer: env("MIHOMO_CONTAINER", "dualroute-gateway-mihomo"), MihomoConfigDir: env("MIHOMO_CONFIG_DIR", "/mihomo-config"), MihomoAPIURL: strings.TrimRight(env("MIHOMO_API_URL", "http://mihomo:9090"), "/"), MihomoMaxSlots: positiveIntEnv("MIHOMO_MAX_SLOTS", 64), MaxInstances: positiveIntEnv("MAX_INSTANCES", 16)}
+	c := Config{ListenAddr: env("CONTROL_LISTEN_ADDR", "0.0.0.0:13338"), APIListenAddr: env("API_LISTEN_ADDR", "0.0.0.0:13337"), InstanceToken: os.Getenv("INSTANCE_ADMIN_TOKEN"), DataDir: env("CONTROL_DATA_DIR", "/control-data"), DockerSocket: env("DOCKER_SOCKET", "/var/run/docker.sock"), DockerNetwork: env("GATEWAY_NETWORK", "dualroute-gateway_default"), GatewayImage: env("GATEWAY_IMAGE", "dualroute-gateway-gateway:latest"), DirectFallback: compatibleBoolEnv("DIRECT_FALLBACK", "NGINX_DIRECT_FALLBACK", false), MihomoContainer: env("MIHOMO_CONTAINER", "dualroute-gateway-mihomo"), MihomoConfigDir: env("MIHOMO_CONFIG_DIR", "/mihomo-config"), MihomoAPIURL: strings.TrimRight(env("MIHOMO_API_URL", "http://mihomo:9090"), "/"), MihomoMaxSlots: positiveIntEnv("MIHOMO_MAX_SLOTS", 64), MaxInstances: positiveIntEnv("MAX_INSTANCES", 16), FreeBuffModelsProxy: strings.TrimSpace(env("FREEBUFF_MODELS_PROXY_URL", "")), FreeBuffModelsURLs: split(env("FREEBUFF_MODELS_URLS", freeBuffModelsURL))}
+	if len(c.FreeBuffModelsURLs) == 0 {
+		c.FreeBuffModelsURLs = []string{freeBuffModelsURL}
+	}
+	for _, raw := range c.FreeBuffModelsURLs {
+		modelURL, err := url.Parse(raw)
+		if err != nil || modelURL.Scheme != "https" || modelURL.Host == "" {
+			return c, fmt.Errorf("FREEBUFF_MODELS_URLS must contain absolute HTTPS URLs")
+		}
+	}
+	if c.FreeBuffModelsProxy != "" {
+		proxyURL, err := url.Parse(c.FreeBuffModelsProxy)
+		if err != nil || (proxyURL.Scheme != "http" && proxyURL.Scheme != "https") || proxyURL.Host == "" {
+			return c, fmt.Errorf("FREEBUFF_MODELS_PROXY_URL must be an absolute HTTP(S) URL")
+		}
+	}
 	if c.MihomoMaxSlots > 128 {
 		c.MihomoMaxSlots = 128
 	}
@@ -275,7 +319,15 @@ func LoadConfig() (Config, error) {
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), upstreamKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session), clineModels: make(map[string]struct{}), modelSettings: defaultModelSettings(), freeBuffModels: append([]string(nil), freeBuffFallbackModels...), geoIPCache: make(map[string]geoIPResult), geoIPClient: &http.Client{Timeout: 3 * time.Second}, geoIPBaseURL: env("GEOIP_URL", "https://ipwho.is")}
+	s := &Server{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, docker: newDockerClient(cfg.DockerSocket), apiInflight: make(map[string]int), apiCircuits: make(map[string]apiCircuit), apiReadiness: make(map[string]apiReadiness), upstreamKeys: make(map[string]string), rotationFailures: make(map[string]string), lastUpstream429: make(map[string]uint64), sessions: make(map[string]session), loginAttempts: make(map[string]loginAttempt), clineModels: make(map[string]struct{}), modelSettings: defaultModelSettings(), freeBuffModels: append([]string(nil), freeBuffFallbackModels...), geoIPCache: make(map[string]geoIPResult), geoIPClient: &http.Client{Timeout: 3 * time.Second}, geoIPBaseURL: env("GEOIP_URL", "https://ipwho.is")}
+	s.freeBuffModelsURLs = append([]string(nil), cfg.FreeBuffModelsURLs...)
+	if len(s.freeBuffModelsURLs) == 0 {
+		s.freeBuffModelsURLs = []string{freeBuffModelsURL}
+	}
+	if cfg.FreeBuffModelsProxy != "" {
+		proxyURL, _ := url.Parse(cfg.FreeBuffModelsProxy)
+		s.freeBuffModelsClient = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: 5 * time.Second}
+	}
 	s.loadInstanceToken()
 	s.loadAuth()
 	s.loadKeys()
@@ -424,15 +476,17 @@ func (s *Server) requestedProvider(r *http.Request) (string, bool, error) {
 		return "", false, nil
 	}
 	if isClineClientType(r.Header.Get("X-CLIENT-TYPE")) {
-		s.registerClineModel(request.Model)
-		clineModel, _ := providerModelFromClient(ProviderCline, request.Model)
+		if !s.registerClineModel(request.Model) {
+			return "", false, fmt.Errorf("invalid or excessive Cline model identifier")
+		}
+		clineModel, _ := s.providerModelFromClient(ProviderCline, request.Model)
 		if !s.modelEnabled(ProviderCline, clineModel) {
 			return "", false, fmt.Errorf("model %q is disabled", request.Model)
 		}
 		return ProviderCline, true, nil
 	}
 	model := strings.TrimSpace(request.Model)
-	if provider, upstreamModel, ok := providerFromClientModel(model); ok {
+	if provider, upstreamModel, ok := s.providerFromClientModel(model); ok {
 		if provider == ProviderFreeBuff && strings.HasPrefix(strings.ToLower(model), "freebuff/") {
 			s.refreshFreeBuffModels()
 			for _, candidate := range s.modelCatalog() {
@@ -470,6 +524,24 @@ func (s *Server) requestedProvider(r *http.Request) (string, bool, error) {
 			}
 		}
 	}
+	if strings.HasPrefix(strings.ToLower(model), "opencode/") {
+		// A model added upstream after the last catalog refresh is resolved by
+		// triggering a refresh and re-checking the dynamic list once.
+		s.refreshOpenCodeModels()
+		for _, candidate := range s.modelCatalog() {
+			if candidate.ID != ProviderOpenCode {
+				continue
+			}
+			for _, item := range candidate.Models {
+				if strings.EqualFold(item.ClientModel, model) {
+					if !s.modelEnabled(ProviderOpenCode, item.ID) {
+						return "", false, fmt.Errorf("model %q is disabled", model)
+					}
+					return ProviderOpenCode, true, nil
+				}
+			}
+		}
+	}
 	{
 		s.clineModelsMu.RLock()
 		_, clineModel := s.clineModels[model]
@@ -489,21 +561,27 @@ func isClineClientType(value string) bool {
 	return value == "cline-vscode" || value == "cline-cli"
 }
 
-func (s *Server) registerClineModel(model string) {
+func (s *Server) registerClineModel(model string) bool {
 	model = strings.TrimSpace(model)
-	if upstream, ok := providerModelFromClient(ProviderCline, model); ok {
+	if upstream, ok := s.providerModelFromClient(ProviderCline, model); ok {
 		model = upstream
 	}
-	if model == "" {
-		return
+	if len(model) == 0 || len(model) > maxClineModelLength || !clineModelPattern.MatchString(model) {
+		return false
 	}
 	s.clineModelsMu.Lock()
+	if _, exists := s.clineModels[model]; !exists && len(s.clineModels) >= maxClineModels {
+		s.clineModelsMu.Unlock()
+		return false
+	}
 	s.clineModels[model] = struct{}{}
 	s.clineModelsMu.Unlock()
+	return true
 }
 
 func (s *Server) models(w http.ResponseWriter, instances []Instance) {
 	s.refreshFreeBuffModels()
+	s.refreshOpenCodeModels()
 	s.refreshClineModels(instances)
 	providers := make(map[string]bool)
 	for _, instance := range instances {
@@ -1913,19 +1991,28 @@ func (s *Server) loadUpstreamKeys() {
 	}
 }
 func (s *Server) persistUpstreamKeysLocked() {
-	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
 	data, _ := json.MarshalIndent(s.upstreamKeys, "", "  ")
-	_ = os.WriteFile(s.cfg.DataDir+"/upstream-keys.json", data, 0o600)
+	if err := writePrivateFileAtomic(s.cfg.DataDir+"/upstream-keys.json", data); err != nil {
+		s.addPersistenceLog("instance upstream keys", err)
+	}
 }
 func (s *Server) persistInstancesLocked() {
-	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
 	data, _ := json.MarshalIndent(s.instances, "", "  ")
-	_ = os.WriteFile(s.cfg.DataDir+"/instances.json", data, 0o600)
+	if err := writePrivateFileAtomic(s.cfg.DataDir+"/instances.json", data); err != nil {
+		s.addPersistenceLog("instances", err)
+	}
 }
 func (s *Server) persistLocked() {
-	os.MkdirAll(s.cfg.DataDir, 0o700)
 	data, _ := json.MarshalIndent(s.keys, "", "  ")
-	os.WriteFile(s.cfg.DataDir+"/keys.json", data, 0o600)
+	if err := writePrivateFileAtomic(s.cfg.DataDir+"/keys.json", data); err != nil {
+		s.addPersistenceLog("gateway keys", err)
+	}
+}
+
+func (s *Server) addPersistenceLog(kind string, err error) {
+	// Persistence is called while different state locks are held, so use the
+	// process logger instead of taking another server lock for audit logging.
+	slog.Error("control-plane persistence failed", "data", kind, "error", err)
 }
 func bearer(r *http.Request, expected string) bool {
 	got := requestBearer(r)

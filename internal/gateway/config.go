@@ -37,14 +37,18 @@ const (
 	opencodeTitle     = "opencode"
 )
 
+// Fallback list used until/unless dynamic discovery covers a model. Keep in
+// sync with the keyless free tier of https://opencode.ai/zen/v1/models.
 var openCodeModels = []string{
 	"big-pickle",
 	"deepseek-v4-flash-free",
 	"hy3-free",
 	"laguna-s-2.1-free",
 	"mimo-v2.5-free",
+	"muse-spark-1.2-contributor-free",
 	"nemotron-3-ultra-free",
 	"nemotron-3.5-lightning-free",
+	"x-preview-f-free",
 }
 
 type Config struct {
@@ -53,6 +57,7 @@ type Config struct {
 	UpstreamURL              string
 	UpstreamAPIKey           string
 	UpstreamAPIKeys          []string
+	FreeBuffModelsURLs       []string
 	ClineTaskID              string
 	ForcedModel              string
 	GatewayKeys              []string
@@ -90,7 +95,8 @@ func DefaultConfig() Config {
 		ProxyProbeURLs: []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://www.cloudflare.com/cdn-cgi/trace"}, ProxyProbeWait: 10 * time.Second,
 		ProxyProbeJobs: 8, DirectEnabled: true,
 		FreeModelsOnly: false, DisableThinkingByDefault: false, MinThinkingMaxTokens: 0, IsolateUpstreamState: true,
-		DataDir: "/data",
+		FreeBuffModelsURLs: []string{freeBuffModelsURL},
+		DataDir:            "/data",
 	}
 }
 
@@ -109,6 +115,18 @@ func LoadConfig() (Config, error) {
 		c.UpstreamURL = strings.TrimRight(v, "/")
 	}
 	c.UpstreamAPIKey = strings.TrimSpace(os.Getenv("UPSTREAM_API_KEY"))
+	if v := os.Getenv("FREEBUFF_MODELS_URLS"); v != "" {
+		c.FreeBuffModelsURLs = split(v)
+	}
+	if len(c.FreeBuffModelsURLs) == 0 {
+		c.FreeBuffModelsURLs = []string{freeBuffModelsURL}
+	}
+	for _, raw := range c.FreeBuffModelsURLs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return c, fmt.Errorf("FREEBUFF_MODELS_URLS must contain absolute HTTPS URLs")
+		}
+	}
 	if c.UpstreamProvider == ProviderFreeBuff {
 		c.UpstreamAPIKeys = split(c.UpstreamAPIKey)
 		if len(c.UpstreamAPIKeys) > 0 {

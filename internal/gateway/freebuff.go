@@ -530,26 +530,30 @@ func (g *Gateway) refreshFreeBuffModelMap() {
 	}
 	client := *g.client
 	client.Timeout = 5 * time.Second
-	response, err := client.Get(freeBuffModelsURL)
-	if err != nil {
+	for _, sourceURL := range g.cfg.FreeBuffModelsURLs {
+		response, err := client.Get(sourceURL)
+		if err != nil {
+			continue
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			response.Body.Close()
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+		response.Body.Close()
+		if readErr != nil {
+			continue
+		}
+		models, parseErr := parseFreeBuffModelMap(data)
+		if parseErr != nil || len(models) == 0 {
+			continue
+		}
+		g.freeBuffModelMu.Lock()
+		g.freeBuffModels = models
+		g.freeBuffModelsAt = time.Now()
+		g.freeBuffModelMu.Unlock()
 		return
 	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
-	if err != nil {
-		return
-	}
-	models, err := parseFreeBuffModelMap(data)
-	if err != nil || len(models) == 0 {
-		return
-	}
-	g.freeBuffModelMu.Lock()
-	g.freeBuffModels = models
-	g.freeBuffModelsAt = time.Now()
-	g.freeBuffModelMu.Unlock()
 }
 
 func parseFreeBuffModelMap(data []byte) (map[string]freeBuffModelInfo, error) {

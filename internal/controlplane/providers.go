@@ -17,7 +17,12 @@ import (
 const (
 	freeBuffModelsURL     = "https://github.com/pingmike2/freebuff2api-wokers/releases/download/models-cache/freebuff-models.json"
 	freeBuffModelsRefresh = 30 * time.Minute
+	freeBuffModelsRetry   = time.Minute
 	freeBuffClientPrefix  = "FreeBuff/"
+
+	openCodeModelsURL     = "https://opencode.ai/zen/v1/models"
+	openCodeModelsRefresh = 30 * time.Minute
+	openCodeModelsRetry   = time.Minute
 )
 
 type ProviderKey struct {
@@ -133,9 +138,10 @@ func (s *Server) loadProviderKeys() {
 }
 
 func (s *Server) persistProviderKeysLocked() {
-	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
 	data, _ := json.MarshalIndent(s.providerKeys, "", "  ")
-	_ = os.WriteFile(s.cfg.DataDir+"/provider-keys.json", data, 0o600)
+	if err := writePrivateFileAtomic(s.cfg.DataDir+"/provider-keys.json", data); err != nil {
+		s.addPersistenceLog("provider keys", err)
+	}
 }
 
 func (s *Server) loadModelSettings() {
@@ -152,9 +158,10 @@ func (s *Server) loadModelSettings() {
 }
 
 func (s *Server) persistModelSettingsLocked() {
-	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
 	data, _ := json.MarshalIndent(s.modelSettings, "", "  ")
-	_ = os.WriteFile(s.cfg.DataDir+"/model-settings.json", data, 0o600)
+	if err := writePrivateFileAtomic(s.cfg.DataDir+"/model-settings.json", data); err != nil {
+		s.addPersistenceLog("model settings", err)
+	}
 }
 
 func (s *Server) providerEnabled(provider string) bool {
@@ -293,6 +300,7 @@ func containsString(values []string, target string) bool {
 func (s *Server) modelSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		s.refreshFreeBuffModels()
+		s.refreshOpenCodeModels()
 		writeJSON(w, http.StatusOK, map[string]any{"providers": s.modelCatalog()})
 		return
 	}
@@ -359,7 +367,7 @@ func catalogContains(catalog []providerCatalog, provider, model string) bool {
 func (s *Server) modelCatalog() []providerCatalog {
 	models := map[string][]string{
 		ProviderTokenRouter: {tokenRouterModel},
-		ProviderOpenCode:    append([]string(nil), openCodeModels...),
+		ProviderOpenCode:    s.openCodeModelList(),
 		ProviderCline:       {clineUpstreamModel},
 		ProviderFreeBuff:    nil,
 	}
@@ -393,56 +401,73 @@ func (s *Server) modelCatalog() []providerCatalog {
 
 func (s *Server) refreshFreeBuffModels() {
 	s.providerModelsMu.RLock()
-	fresh := time.Since(s.freeBuffModelsAt) < freeBuffModelsRefresh
+	now := time.Now()
+	fresh := time.Since(s.freeBuffModelsAt) < freeBuffModelsRefresh || now.Before(s.freeBuffModelsRetryAt) || s.freeBuffModelsRefreshing
 	s.providerModelsMu.RUnlock()
 	if fresh {
 		return
 	}
 	s.providerModelsMu.Lock()
-	if time.Since(s.freeBuffModelsAt) < freeBuffModelsRefresh {
+	if time.Since(s.freeBuffModelsAt) < freeBuffModelsRefresh || time.Now().Before(s.freeBuffModelsRetryAt) || s.freeBuffModelsRefreshing {
 		s.providerModelsMu.Unlock()
 		return
 	}
-	s.freeBuffModelsAt = time.Now()
+	s.freeBuffModelsRefreshing = true
 	s.providerModelsMu.Unlock()
-	client := *s.client
+	defer func() {
+		s.providerModelsMu.Lock()
+		s.freeBuffModelsRefreshing = false
+		s.providerModelsMu.Unlock()
+	}()
+	baseClient := s.client
+	if s.freeBuffModelsClient != nil {
+		baseClient = s.freeBuffModelsClient
+	}
+	client := *baseClient
 	client.Timeout = 5 * time.Second
-	response, err := client.Get(freeBuffModelsURL)
-	if err != nil {
-		return
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return
-	}
-	var payload struct {
-		Models []struct {
-			ID string `json:"id"`
-		} `json:"models"`
-	}
-	if json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&payload) != nil {
-		return
-	}
-	models := make([]string, 0, len(payload.Models))
-	for _, item := range payload.Models {
-		if model := strings.TrimSpace(item.ID); model != "" {
-			models = append(models, model)
+	for _, sourceURL := range s.freeBuffModelsURLs {
+		response, err := client.Get(sourceURL)
+		if err != nil {
+			continue
 		}
-	}
-	if len(models) > 0 {
+		var payload struct {
+			Models []struct {
+				ID string `json:"id"`
+			} `json:"models"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&payload)
+		response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 || decodeErr != nil {
+			continue
+		}
+		models := make([]string, 0, len(payload.Models))
+		for _, item := range payload.Models {
+			if model := strings.TrimSpace(item.ID); model != "" {
+				models = append(models, model)
+			}
+		}
+		if len(models) == 0 {
+			continue
+		}
 		s.providerModelsMu.Lock()
 		s.freeBuffModels = models
+		s.freeBuffModelsAt = time.Now()
+		s.freeBuffModelsRetryAt = time.Time{}
 		s.providerModelsMu.Unlock()
+		return
 	}
+	s.providerModelsMu.Lock()
+	s.freeBuffModelsRetryAt = time.Now().Add(freeBuffModelsRetry)
+	s.providerModelsMu.Unlock()
 }
 
-func providerModelFromClient(provider, model string) (string, bool) {
+func (s *Server) providerModelFromClient(provider, model string) (string, bool) {
 	model = strings.TrimSpace(model)
 	switch provider {
 	case ProviderTokenRouter:
 		return tokenRouterModel, model == tokenRouterModel || model == tokenRouterClientModel
 	case ProviderOpenCode:
-		for _, upstream := range openCodeModels {
+		for _, upstream := range s.openCodeModelList() {
 			if model == upstream || model == openCodeClientModelFor(upstream) {
 				return upstream, true
 			}
@@ -462,13 +487,102 @@ func providerModelFromClient(provider, model string) (string, bool) {
 	return model, false
 }
 
-func providerFromClientModel(model string) (string, string, bool) {
+func (s *Server) providerFromClientModel(model string) (string, string, bool) {
 	for _, provider := range []string{ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff} {
-		if upstream, ok := providerModelFromClient(provider, model); ok {
+		if upstream, ok := s.providerModelFromClient(provider, model); ok {
 			return provider, upstream, true
 		}
 	}
 	return "", "", false
+}
+
+// openCodeModelList returns the keyless OpenCode models advertised by the
+// control plane: the dynamically discovered free tier when available, with the
+// curated fallback list used until the first successful refresh.
+func (s *Server) openCodeModelList() []string {
+	s.openCodeModelsMu.RLock()
+	dynamic := s.openCodeDynamicModels
+	s.openCodeModelsMu.RUnlock()
+	if len(dynamic) == 0 {
+		return append([]string(nil), openCodeModels...)
+	}
+	return append([]string(nil), dynamic...)
+}
+
+// refreshOpenCodeModels periodically mirrors the free tier of the upstream
+// OpenCode catalog. A fetched model is kept when it ends in "-free" (the
+// keyless tier) or is already part of the curated fallback list; everything
+// else requires upstream credentials and stays out of the catalog.
+func (s *Server) refreshOpenCodeModels() {
+	s.openCodeModelsMu.RLock()
+	now := time.Now()
+	fresh := time.Since(s.openCodeModelsAt) < openCodeModelsRefresh || now.Before(s.openCodeModelsRetryAt) || s.openCodeModelsRefreshing
+	s.openCodeModelsMu.RUnlock()
+	if fresh {
+		return
+	}
+	s.openCodeModelsMu.Lock()
+	if time.Since(s.openCodeModelsAt) < openCodeModelsRefresh || time.Now().Before(s.openCodeModelsRetryAt) || s.openCodeModelsRefreshing {
+		s.openCodeModelsMu.Unlock()
+		return
+	}
+	s.openCodeModelsRefreshing = true
+	s.openCodeModelsMu.Unlock()
+	defer func() {
+		s.openCodeModelsMu.Lock()
+		s.openCodeModelsRefreshing = false
+		s.openCodeModelsMu.Unlock()
+	}()
+	client := *s.client
+	client.Timeout = 5 * time.Second
+	response, err := client.Get(openCodeModelsURL)
+	if err != nil {
+		s.openCodeModelsMu.Lock()
+		s.openCodeModelsRetryAt = time.Now().Add(openCodeModelsRetry)
+		s.openCodeModelsMu.Unlock()
+		return
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	decodeErr := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&payload)
+	response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 || decodeErr != nil {
+		s.openCodeModelsMu.Lock()
+		s.openCodeModelsRetryAt = time.Now().Add(openCodeModelsRetry)
+		s.openCodeModelsMu.Unlock()
+		return
+	}
+	fallback := make(map[string]struct{}, len(openCodeModels))
+	for _, model := range openCodeModels {
+		fallback[model] = struct{}{}
+	}
+	models := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		model := strings.TrimSpace(item.ID)
+		if model == "" || len(model) > maxClineModelLength || !openCodeModelPattern.MatchString(model) {
+			continue
+		}
+		_, curated := fallback[model]
+		if !curated && !strings.HasSuffix(model, "-free") {
+			continue
+		}
+		models = append(models, model)
+	}
+	if len(models) == 0 {
+		s.openCodeModelsMu.Lock()
+		s.openCodeModelsRetryAt = time.Now().Add(openCodeModelsRetry)
+		s.openCodeModelsMu.Unlock()
+		return
+	}
+	sort.Strings(models)
+	s.openCodeModelsMu.Lock()
+	s.openCodeDynamicModels = models
+	s.openCodeModelsAt = time.Now()
+	s.openCodeModelsRetryAt = time.Time{}
+	s.openCodeModelsMu.Unlock()
 }
 
 func providerKeyRequired(provider string) bool {

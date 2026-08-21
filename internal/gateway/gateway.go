@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -270,9 +271,11 @@ func New(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		for _, slot := range staticSlots {
 			slot.disabled = true
 		}
-		go g.probeAndDeduplicateStaticSlots()
+		// Do not make a pre-deduplicated static list available to a later
+		// dynamic refresh. The initial probe is parallel internally.
+		g.probeAndDeduplicateStaticSlots()
 	} else if directSlot != nil && len(cfg.ProxyProbeURLs) > 0 {
-		go g.probeDirectSlot(directSlot)
+		g.probeDirectSlot(directSlot)
 	}
 	g.base = append([]*proxySlot(nil), g.slots...)
 	if cfg.ProxyListFile != "" {
@@ -1008,15 +1011,43 @@ func (g *Gateway) loadKeys() {
 }
 
 func (g *Gateway) persistKeysLocked() {
-	if err := os.MkdirAll(g.cfg.DataDir, 0o700); err != nil {
-		return
-	}
 	keys := make([]string, 0, len(g.keys))
 	for key := range g.keys {
 		keys = append(keys, key)
 	}
 	data, _ := json.MarshalIndent(keys, "", "  ")
-	_ = os.WriteFile(g.cfg.DataDir+"/keys.json", data, 0o600)
+	if err := writeGatewayPrivateFileAtomic(g.cfg.DataDir+"/keys.json", data); err != nil && g.log != nil {
+		g.log.Error("persist gateway keys failed", "error", err)
+	}
+}
+
+func writeGatewayPrivateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".write-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func (g *Gateway) addLog(level, message string, fields map[string]any) {
@@ -1596,6 +1627,12 @@ func stripClientModelAlias(provider, model string) string {
 	case ProviderOpenCode:
 		if upstream, ok := openCodeUpstreamModel(model); ok {
 			return upstream
+		}
+		// Unknown alias (e.g. a free model added upstream after this build):
+		// strip the client prefix so the FreeModelsOnly suffixing produces a
+		// valid upstream model name instead of forwarding the alias verbatim.
+		if strings.HasPrefix(strings.ToLower(model), "opencode/") {
+			return strings.TrimSpace(model[len("opencode/"):])
 		}
 	case ProviderCline:
 		if model == clineClientModel {

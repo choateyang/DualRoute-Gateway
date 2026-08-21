@@ -2,7 +2,7 @@
 
 DualRoute Gateway 是一个 Docker 部署的多上游 OpenAI 兼容 API 网关。它提供统一的 API 地址和管理控制台，用于管理实例、网关访问密钥、上游凭据、模型开关、Mihomo 出口、审计日志与用量统计。
 
-当前版本：`1.2.1`
+当前版本：`1.2.4`
 
 ## 支持的上游
 
@@ -14,13 +14,17 @@ DualRoute Gateway 是一个 Docker 部署的多上游 OpenAI 兼容 API 网关�
 | OpenCode | `OpenCode/hy3` | `hy3-free` |
 | OpenCode | `OpenCode/laguna-s-2.1` | `laguna-s-2.1-free` |
 | OpenCode | `OpenCode/mimo-v2.5` | `mimo-v2.5-free` |
+| OpenCode | `OpenCode/muse-spark-1.2-contributor` | `muse-spark-1.2-contributor-free` |
 | OpenCode | `OpenCode/nemotron-3-ultra` | `nemotron-3-ultra-free` |
 | OpenCode | `OpenCode/nemotron-3.5-lightning` | `nemotron-3.5-lightning-free` |
+| OpenCode | `OpenCode/x-preview-f` | `x-preview-f-free` |
 | Cline | `cline/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` |
 | FreeBuff | `FreeBuff/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` |
 | FreeBuff | `FreeBuff/deepseek-v4-pro` | `deepseek/deepseek-v4-pro` |
 
 FreeBuff 的其他动态模型也以 `FreeBuff/<短模型名>` 展示。例如 `mimo/mimo-v2.5` 会显示为 `FreeBuff/mimo-v2.5`。模型列表每 30 分钟从动态目录刷新一次；控制面只展示已启用上游可用的模型。
+
+OpenCode 免费模型目录每 30 分钟从 `https://opencode.ai/zen/v1/models` 动态刷新：新增的 `-free` 模型自动进入目录，上游下架的模型自动移除；内置列表仅作为首次启动前的兜底。付费模型需要上游凭据，不会出现在目录中。所有模型都可在控制台“模型管理”页单独开关。
 
 ## 功能
 
@@ -120,6 +124,8 @@ curl --no-buffer http://127.0.0.1:13337/v1/chat/completions \
 | `REQUEST_TIMEOUT` | `5m` | 单个上游请求超时 |
 | `COOLDOWN_MAX` | `60s` | 出口或 FreeBuff 账号最低冷却依据 |
 | `ISOLATE_UPSTREAM_STATE` | `true` | TokenRouter 默认移除会话状态字段 |
+| `FREEBUFF_MODELS_PROXY_URL` | 空 | 可选 HTTP/HTTPS 代理，仅用于控制台刷新 FreeBuff 动态模型目录 |
+| `FREEBUFF_MODELS_URLS` | 官方 GitHub Release 地址 | 逗号分隔的目录地址列表，失败时按顺序使用下一个可信 GitHub 反代 |
 
 ## 升级与排错
 

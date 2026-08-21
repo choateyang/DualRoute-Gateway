@@ -8,17 +8,24 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	authCookieName = "dualroute_gateway_session"
-	sessionTTL     = 8 * time.Hour
-	pbkdf2Rounds   = 120000
+	authCookieName         = "dualroute_gateway_session"
+	sessionTTL             = 8 * time.Hour
+	pbkdf2Rounds           = 120000
+	maxLoginFailures       = 5
+	loginWindow            = 15 * time.Minute
+	loginCooldown          = 15 * time.Minute
+	maxLoginAttemptEntries = 4096
 )
 
 type adminCredential struct {
@@ -30,6 +37,12 @@ type adminCredential struct {
 
 type session struct {
 	ExpiresAt time.Time
+}
+
+type loginAttempt struct {
+	Failures int
+	FirstAt  time.Time
+	Until    time.Time
 }
 
 func (s *Server) loadInstanceToken() {
@@ -51,8 +64,9 @@ func (s *Server) persistInstanceToken(token string) {
 	if s.cfg.DataDir == "" || token == "" {
 		return
 	}
-	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
-	_ = os.WriteFile(filepath.Join(s.cfg.DataDir, "instance-token"), []byte(token+"\n"), 0o600)
+	if err := writePrivateFileAtomic(filepath.Join(s.cfg.DataDir, "instance-token"), []byte(token+"\n")); err != nil {
+		slog.Error("persist instance token failed", "error", err)
+	}
 }
 
 func (s *Server) loadAuth() {
@@ -82,9 +96,10 @@ func (s *Server) persistAuthLocked() {
 	if s.cfg.DataDir == "" {
 		return
 	}
-	_ = os.MkdirAll(s.cfg.DataDir, 0o700)
 	data, _ := json.MarshalIndent(s.auth, "", "  ")
-	_ = os.WriteFile(filepath.Join(s.cfg.DataDir, "admin.json"), data, 0o600)
+	if err := writePrivateFileAtomic(filepath.Join(s.cfg.DataDir, "admin.json"), data); err != nil {
+		slog.Error("persist administrator credential failed", "error", err)
+	}
 }
 
 func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
@@ -101,16 +116,111 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid_body"}`, http.StatusBadRequest)
 		return
 	}
+	client := loginClientIdentity(r)
+	if retryAfter, limited := s.loginRateLimited(client); limited {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		http.Error(w, `{"error":"too_many_login_attempts"}`, http.StatusTooManyRequests)
+		return
+	}
 	s.authMu.Lock()
 	valid := strings.TrimSpace(body.Username) == s.auth.Username && verifyPassword(s.auth, body.Password)
 	mustChange := s.auth.MustChangePassword
 	s.authMu.Unlock()
 	if !valid {
+		s.recordLoginFailure(client)
 		http.Error(w, `{"error":"invalid_credentials"}`, http.StatusUnauthorized)
 		return
 	}
+	s.clearLoginFailures(client)
 	s.createSession(w, r)
 	writeJSON(w, http.StatusOK, map[string]any{"must_change_password": mustChange})
+}
+
+func loginClientIdentity(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil || host == "" {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	// The control listener is normally bound to loopback. Only in that case do
+	// we accept a reverse proxy's X-Forwarded-For value.
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if forwarded, _, _ := strings.Cut(r.Header.Get("X-Forwarded-For"), ","); net.ParseIP(strings.TrimSpace(forwarded)) != nil {
+			return strings.TrimSpace(forwarded)
+		}
+	}
+	return host
+}
+
+func (s *Server) loginRateLimited(client string) (int, bool) {
+	now := time.Now()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	attempt, exists := s.loginAttempts[client]
+	if !exists || !now.Before(attempt.Until) {
+		if exists && !attempt.Until.IsZero() {
+			delete(s.loginAttempts, client)
+		}
+		return 0, false
+	}
+	return max(1, int(time.Until(attempt.Until).Seconds()+0.999)), true
+}
+
+func (s *Server) recordLoginFailure(client string) {
+	now := time.Now()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	for key, attempt := range s.loginAttempts {
+		if !attempt.Until.IsZero() && !now.Before(attempt.Until) {
+			delete(s.loginAttempts, key)
+		}
+	}
+	if len(s.loginAttempts) >= maxLoginAttemptEntries {
+		return
+	}
+	attempt := s.loginAttempts[client]
+	if attempt.FirstAt.IsZero() || now.Sub(attempt.FirstAt) > loginWindow {
+		attempt = loginAttempt{FirstAt: now}
+	}
+	attempt.Failures++
+	if attempt.Failures >= maxLoginFailures {
+		attempt.Until = now.Add(loginCooldown)
+	}
+	s.loginAttempts[client] = attempt
+}
+
+func (s *Server) clearLoginFailures(client string) {
+	s.loginMu.Lock()
+	delete(s.loginAttempts, client)
+	s.loginMu.Unlock()
+}
+
+func writePrivateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".write-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {

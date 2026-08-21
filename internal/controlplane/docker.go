@@ -235,6 +235,7 @@ func (d *dockerClient) create(cfg Config, instance Instance, keys []string, upst
 		"DISABLE_THINKING_BY_DEFAULT=" + strconv.FormatBool(instance.Provider == ProviderOpenCode),
 		"MIN_THINKING_MAX_TOKENS=" + providerThinkingTokenBudget(instance.Provider),
 		"ISOLATE_UPSTREAM_STATE=" + env("ISOLATE_UPSTREAM_STATE", "true"),
+		"FREEBUFF_MODELS_URLS=" + strings.Join(cfg.FreeBuffModelsURLs, ","),
 	}
 	labels := map[string]string{
 		managedLabel:                         "true",
@@ -386,6 +387,7 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 		"PROXY_PROBE_CONCURRENCY": env("PROXY_PROBE_CONCURRENCY", "8"), "TARGET_EGRESS_SLOTS": env("TARGET_EGRESS_SLOTS", "0"),
 		"FREE_MODELS_ONLY": strconv.FormatBool(instance.Provider == ProviderOpenCode), "DISABLE_THINKING_BY_DEFAULT": strconv.FormatBool(instance.Provider == ProviderOpenCode), "MIN_THINKING_MAX_TOKENS": providerThinkingTokenBudget(instance.Provider),
 		"ISOLATE_UPSTREAM_STATE": env("ISOLATE_UPSTREAM_STATE", "true"),
+		"FREEBUFF_MODELS_URLS":   strings.Join(cfg.FreeBuffModelsURLs, ","),
 	}
 	environment := mergeEnvironment(original.Config.Env, overrides)
 	labels := map[string]string{}
