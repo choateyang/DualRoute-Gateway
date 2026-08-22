@@ -1,4 +1,4 @@
-const APP_VERSION = '1.2.4';
+const APP_VERSION = '1.2.24';
 const PAGE = document.body.dataset.page;
 const $ = id => document.getElementById(id);
 const esc = value => String(value || '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -24,7 +24,8 @@ const PAGE_META = {
 let state = {};
 let mihomoPage = 0;
 let selectedLogSource = 'control';
-const providerName = value => ({ tokenrouter: 'TokenRouter', opencode: 'OpenCode', cline: 'Cline', freebuff: 'FreeBuff' }[value] || value);
+const expandedModelProviders = new Set();
+const providerName = value => ({ tokenrouter: 'TokenRouter', opencode: 'OpenCode', cline: 'Cline', freebuff: 'FreeBuff', vertex: 'Vertex' }[value] || value);
 
 function timeStamp() { $('updated').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN'); }
 function activeSlots(instance) {
@@ -74,7 +75,7 @@ function renderInstances() {
       const cooldowns = (slot.model_cooldowns || []).map(item => '<span class="badge wait" title="恢复时间 ' + esc(item.ready_at || '') + '">' + esc(item.model || '模型') + ' 冷却</span>').join(' ');
       return node + (duplicate ? ' <span class="badge wait" title="重复出口，控制面会自动切换">重复出口</span>' : '') + (cooldowns ? ' ' + cooldowns : '') + (item.slots && item.slots.length > 1 ? ' <span class="badge pool" title="仅在 429 或故障时切换">' + item.slots.length + ' 个候选</span>' : '');
     }).join(', ') || '-';
-    const maskedKey = item.provider === 'opencode' && item.auth_mode === 'public' ? '公共访问' : (item.upstream_key_label || compactKey(item.upstream_api_key_masked || '未设置'));
+    const maskedKey = (item.provider === 'opencode' || item.provider === 'vertex') && item.auth_mode === 'public' ? (item.provider === 'vertex' ? '内置直连' : '公共访问') : (item.upstream_key_label || compactKey(item.upstream_api_key_masked || '未设置'));
     return '<tr><td><strong>' + esc(item.instance) + '</strong><small class="mono muted">' + esc((item.container_id || '').slice(0, 12) || '-') + '</small></td><td>' + statusBadge(item.online ? '在线' : (item.status || '停止'), item.online) + ' ' + statusBadge(item.in_traffic_pool ? '流量池' : '未接入', item.in_traffic_pool) + '</td><td>' + statusBadge(provider, item.provider !== 'opencode') + '</td><td class="mono" title="' + esc(item.upstream_api_key_masked || '') + '">' + esc(maskedKey) + '</td><td>' + (Number(item.max_concurrency) || 0) + '</td><td class="mono">' + exits + '</td><td>' + instanceActions(item) + '</td></tr>';
   }).join('') || '<tr><td colspan="7">暂无实例，请新建实例并设置上游 API Key。</td></tr>';
 }
@@ -91,18 +92,18 @@ function setProviderKeyIDs(form, ids) {
   form.elements.upstream_key_id.value = [...selected][0] || '';
 }
 function syncProviderKey(form, requestedIDs) {
-  const openCode = form.elements.provider.value === 'opencode';
   const provider = form.elements.provider.value;
+  const keyless = provider === 'opencode' || provider === 'vertex';
   const selected = requestedIDs || selectedProviderKeyIDs(form);
   const keys = (state.providerKeys || []).filter(item => item.provider === provider);
   const multiple = provider === 'freebuff';
   const choices = form.querySelector('[data-provider-key-options]');
   const selectedIDs = new Set(selected);
-  choices.innerHTML = keys.length ? keys.map(item => '<button type="button" class="provider-key-choice" data-provider-key-option data-key-id="' + esc(item.id) + '" aria-pressed="' + (selectedIDs.has(item.id) ? 'true' : 'false') + '" title="' + esc(item.secret_masked || '') + '"><span class="key-choice-indicator" aria-hidden="true"></span><span class="provider-key-choice-text"><strong>' + esc(item.label) + '</strong><small>' + esc(item.secret_masked || '-') + '</small></span></button>').join('') : '<p class="empty-inline">该上游尚未保存密钥</p>';
+  choices.innerHTML = keys.length ? keys.map(item => '<button type="button" class="provider-key-choice" data-provider-key-option data-key-id="' + esc(item.id) + '" aria-pressed="' + (selectedIDs.has(item.id) ? 'true' : 'false') + '" title="' + esc(item.secret_masked || '') + '"><span class="key-choice-indicator" aria-hidden="true"></span><span class="provider-key-choice-text"><strong>' + esc(item.label) + '</strong><small>' + esc(item.secret_masked || '-') + '</small></span></button>').join('') : '<p class="empty-inline">' + (provider === 'vertex' ? 'Vertex 由网关直接调用 Google 匿名端点，无需上游密钥' : '该上游尚未保存密钥') + '</p>';
   setProviderKeyIDs(form, selected);
   form.querySelector('[data-provider-key-title]').textContent = multiple ? '上游密钥（可多选）' : '上游密钥';
-  form.querySelectorAll('[data-provider-key]').forEach(node => { node.hidden = openCode; });
-  form.querySelectorAll('[data-public-access]').forEach(node => { node.hidden = !openCode; });
+  form.querySelectorAll('[data-provider-key]').forEach(node => { node.hidden = keyless; });
+  form.querySelectorAll('[data-public-access]').forEach(node => { node.hidden = provider !== 'opencode'; });
 }
 function syncMihomoCandidateText(form) {
   const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices');
@@ -111,6 +112,21 @@ function syncMihomoCandidateText(form) {
   if (!inputs.length) return false;
   form.elements.proxy_urls.value = inputs.filter(input => input.checked && !input.disabled).map(input => input.value).join('\n');
   return true;
+}
+// Vertex 实例：创建窗口不展示出口选择，自动使用全部候选出口；
+// 设置窗口保留可编辑列表，便于调整。
+function syncVertexExitUI(form) {
+  const vertex = (form.elements.provider.value || '') === 'vertex';
+  const hideUI = vertex && form.id === 'createForm';
+  form.querySelectorAll('[data-proxy-field]').forEach(node => { node.hidden = hideUI; });
+  form.querySelectorAll('[data-mihomo-panel]').forEach(node => { node.hidden = hideUI; });
+  form.querySelectorAll('[data-proxy-note]').forEach(node => { node.hidden = hideUI; });
+  if (hideUI) {
+    const candidates = state.mihomoCandidates || [];
+    if (candidates.length) {
+      form.elements.proxy_urls.value = candidates.map(item => item.url).join('\n');
+    }
+  }
 }
 function renderMihomoCandidates(form, result) {
   const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices');
@@ -126,8 +142,14 @@ function renderMihomoCandidates(form, result) {
     list.innerHTML = '<span class="muted">请先在 Mihomo 转换页面保存订阅。</span>';
     return;
   }
-  const existing = new Set((form.elements.proxy_urls.value || '').split(/\r?\n|,/).map(value => value.trim()).filter(Boolean));
+  state.mihomoCandidates = candidates;
   const provider = form.elements.provider.value || 'tokenrouter';
+  syncVertexExitUI(form);
+  if (provider === 'vertex' && form.id === 'createForm') {
+    list.innerHTML = '<span class="muted">Vertex 实例自动使用全部候选出口，无需手动选择。</span>';
+    return;
+  }
+  const existing = new Set((form.elements.proxy_urls.value || '').split(/\r?\n|,/).map(value => value.trim()).filter(Boolean));
   const editingInstance = form.elements.name?.value || '';
   const owners = new Map();
   (state.instances || []).forEach(instance => {
@@ -144,7 +166,11 @@ function renderMihomoCandidates(form, result) {
     return '<label class="mihomo-choice ' + (blocked ? 'unhealthy' : 'healthy') + '"><input type="checkbox" value="' + esc(item.url) + '"' + (blocked ? ' disabled' : '') + (existing.has(item.url) ? ' checked' : '') + '><span class="health-dot" aria-hidden="true"></span><span class="choice-port">' + esc(item.url.split(':').pop() || '-') + '</span><code>' + esc(item.url) + '</code><span class="choice-state">' + esc(stateLabel) + '</span></label>';
   }).join('');
   list.querySelectorAll('input[type="checkbox"]').forEach(input => { input.onchange = () => syncMihomoCandidateText(form); });
-  if (existing.size > 0) syncMihomoCandidateText(form);
+  // Vertex 实例创建时强制预选全部可用出口。
+  if (provider === 'vertex') {
+    list.querySelectorAll('input[type="checkbox"]').forEach(input => { if (!input.disabled) input.checked = true; });
+  }
+  if (existing.size > 0 || provider === 'vertex') syncMihomoCandidateText(form);
 }
 async function loadMihomoCandidates(form) {
   const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices');
@@ -158,6 +184,7 @@ function resetCreateForm() {
   form.reset();
   form.elements.provider.value = 'tokenrouter';
   form.elements.proxy_urls.value = '';
+  syncVertexExitUI(form);
   form.elements.max_concurrency.value = '4';
   form.elements.queue_size.value = '8';
   syncProviderKey(form, []);
@@ -182,7 +209,10 @@ async function loadProviderKeys() { const result = await api('/provider-keys'); 
 
 function renderModels(result) {
   const providers = result.providers || [];
-  $('modelGroups').innerHTML = providers.map(provider => '<section class="model-provider ' + (provider.enabled ? '' : 'disabled') + '"><div class="model-provider-head"><div><strong>' + esc(provider.name) + '</strong><small>' + (provider.models || []).filter(item => item.enabled).length + ' / ' + (provider.models || []).length + ' 个模型启用</small></div><label class="switch"><input class="provider-toggle" type="checkbox" data-provider="' + esc(provider.id) + '"' + (provider.enabled ? ' checked' : '') + '><span></span><b>' + (provider.enabled ? '已启用' : '已关闭') + '</b></label></div><div class="model-list">' + (provider.models || []).map(model => '<div class="model-row"><div><code>' + esc(model.client_model) + '</code><small>上游模型：' + esc(model.id) + '</small></div><label class="switch"><input class="model-toggle" type="checkbox" data-provider="' + esc(provider.id) + '" data-model="' + esc(model.id) + '"' + (model.enabled ? ' checked' : '') + (provider.enabled ? '' : ' disabled') + '><span></span><b>' + (model.enabled ? '显示' : '隐藏') + '</b></label></div>').join('') + '</div></section>').join('');
+  $('modelGroups').innerHTML = providers.map(provider => {
+    const expanded = expandedModelProviders.has(provider.id);
+    return '<section class="model-provider' + (provider.enabled ? '' : ' disabled') + (expanded ? '' : ' collapsed') + '" data-model-provider="' + esc(provider.id) + '"><div class="model-provider-head"><div class="model-provider-title"><button type="button" class="model-collapse" data-provider-collapse="' + esc(provider.id) + '" aria-expanded="' + (expanded ? 'true' : 'false') + '" title="' + (expanded ? '收起模型列表' : '展开模型列表') + '"><span class="chevron" aria-hidden="true"></span></button><div><strong>' + esc(provider.name) + '</strong><small>' + (provider.models || []).filter(item => item.enabled).length + ' / ' + (provider.models || []).length + ' 个模型启用</small></div></div><label class="switch"><input class="provider-toggle" type="checkbox" data-provider="' + esc(provider.id) + '"' + (provider.enabled ? ' checked' : '') + '><span></span><b>' + (provider.enabled ? '已启用' : '已关闭') + '</b></label></div><div class="model-list">' + (provider.models || []).map(model => '<div class="model-row"><div><code>' + esc(model.client_model) + '</code><small>上游模型：' + esc(model.id) + '</small></div><label class="switch"><input class="model-toggle" type="checkbox" data-provider="' + esc(provider.id) + '" data-model="' + esc(model.id) + '"' + (model.enabled ? ' checked' : '') + (provider.enabled ? '' : ' disabled') + '><span></span><b>' + (model.enabled ? '显示' : '隐藏') + '</b></label></div>').join('') + '</div></section>';
+  }).join('');
 }
 async function loadModels() { renderModels(await api('/model-settings')); }
 function renderMihomo() {
@@ -297,7 +327,7 @@ async function loadPage() {
 }
 function bindPage() {
   if (PAGE === 'instances') {
-    ['createForm', 'settingsForm'].forEach(id => { const form = $(id); syncProviderKey(form, []); form.elements.provider.onchange = () => { syncProviderKey(form, []); loadMihomoCandidates(form); }; form.elements.proxy_urls.addEventListener('input', () => { const selected = new Set(form.elements.proxy_urls.value.split(/\r?\n|,/).map(value => value.trim()).filter(Boolean)); const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices'); if (list) list.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = selected.has(input.value); }); }); });
+    ['createForm', 'settingsForm'].forEach(id => { const form = $(id); syncProviderKey(form, []); form.elements.provider.onchange = () => { syncProviderKey(form, []); syncVertexExitUI(form); loadMihomoCandidates(form); }; form.elements.proxy_urls.addEventListener('input', () => { const selected = new Set(form.elements.proxy_urls.value.split(/\r?\n|,/).map(value => value.trim()).filter(Boolean)); const list = $(form.id === 'settingsForm' ? 'settingsMihomoChoices' : 'createMihomoChoices'); if (list) list.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = selected.has(input.value); }); }); });
     $('openCreate').onclick = () => { resetCreateForm(); $('createDialog').showModal(); loadMihomoCandidates($('createForm')); };
     $('instanceProbe').onclick = loadPage;
     $('createForm').onsubmit = instanceSubmit('/instances', 'POST', 'createDialog');
@@ -330,7 +360,7 @@ function instanceSubmit(path, method, dialog) {
     const data = new FormData(form);
     const target = path || '/instances/' + encodeURIComponent(data.get('name'));
     const upstreamKeyIDs = selectedProviderKeyIDs(form);
-    if (data.get('provider') !== 'opencode' && !upstreamKeyIDs.length) { alert('请选择至少一个上游密钥。'); return; }
+    if (data.get('provider') !== 'opencode' && data.get('provider') !== 'vertex' && !upstreamKeyIDs.length) { alert('请选择至少一个上游密钥。'); return; }
   const payload = { name: data.get('name').trim(), provider: data.get('provider'), upstream_key_id: upstreamKeyIDs[0] || '', upstream_key_ids: upstreamKeyIDs, max_concurrency: Number(data.get('max_concurrency')), queue_size: Number(data.get('queue_size')), proxy_urls: data.get('proxy_urls').split(/\r?\n|,/).map(value => value.trim()).filter(Boolean) };
     try { await api(target, { method: method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }); $(dialog).close(); loadPage(); } catch (error) { alert('保存失败：' + error.message); }
   };
@@ -353,6 +383,19 @@ document.addEventListener('click', async event => {
   }
   const providerKeyDelete = event.target.closest('.provider-key-delete');
   if (providerKeyDelete && confirm('删除这个上游密钥？正在使用的密钥不能删除。')) { try { await api('/provider-keys/' + encodeURIComponent(providerKeyDelete.dataset.id), { method: 'DELETE' }); loadPage(); } catch (error) { alert('删除失败：' + error.message); } return; }
+  const modelCollapse = event.target.closest('.model-collapse');
+  if (modelCollapse) {
+    const providerId = modelCollapse.dataset.providerCollapse;
+    const section = modelCollapse.closest('.model-provider');
+    if (providerId && section) {
+      const expanded = !expandedModelProviders.has(providerId);
+      if (expanded) expandedModelProviders.add(providerId); else expandedModelProviders.delete(providerId);
+      section.classList.toggle('collapsed', !expanded);
+      modelCollapse.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      modelCollapse.title = expanded ? '收起模型列表' : '展开模型列表';
+    }
+    return;
+  }
   const modelToggle = event.target.closest('.model-toggle, .provider-toggle');
   if (modelToggle) { try { const result = await api('/model-settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: modelToggle.dataset.provider, model: modelToggle.dataset.model || '', enabled: modelToggle.checked }) }); renderModels(result); timeStamp(); } catch (error) { modelToggle.checked = !modelToggle.checked; alert('更新失败：' + error.message); } return; }
   const source = event.target.closest('.log-source');

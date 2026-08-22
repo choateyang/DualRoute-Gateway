@@ -2,7 +2,7 @@
 
 DualRoute Gateway 是一个 Docker 部署的多上游 OpenAI 兼容 API 网关。它提供统一的 API 地址和管理控制台，用于管理实例、网关访问密钥、上游凭据、模型开关、Mihomo 出口、审计日志与用量统计。
 
-当前版本：`1.2.4`
+当前版本：`1.2.23`
 
 ## 支持的上游
 
@@ -21,6 +21,17 @@ DualRoute Gateway 是一个 Docker 部署的多上游 OpenAI 兼容 API 网关�
 | Cline | `cline/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` |
 | FreeBuff | `FreeBuff/deepseek-v4-flash` | `deepseek/deepseek-v4-flash` |
 | FreeBuff | `FreeBuff/deepseek-v4-pro` | `deepseek/deepseek-v4-pro` |
+| Vertex | `Vertex/gemini-3.5-flash` | `gemini-3.5-flash`（内置直连） |
+
+Vertex 上游由网关**内置直连** Google 匿名端点（移植自 vproxy 项目：TLS 指纹伪装、reCAPTCHA token 自动获取、OpenAI↔Gemini 协议转换、**并发竞速**），无需部署任何额外服务，也无需上游密钥。创建 Vertex 实例并像其他上游一样分配 HTTP/HTTPS/SOCKS5(含 SOCKS5H) 候选出口即可；每次请求会对实例的**全部可用出口并发竞速**（对冲延迟启动，首个成功者胜出，其余取消），429 由竞速层自动换出口消化。`Vertex/<模型名>` 前缀在转发时自动剥离。
+
+支持的 Vertex 端点：
+
+- `/v1/chat/completions`：聊天补全，流式/非流式、工具调用、多模态输入
+- `/v1/images/generations`、`/v1/images/edits`、`/v1/images/variations`：图像生成与编辑（gemini-image / imagen / virtual-try-on 系列）
+- `/v1/audio/speech`：文本转语音（gemini-3.1-flash-tts-preview，支持 OpenAI 音色名映射与 WAV 封装）
+- `/v1beta/models/{model}:countTokens`：token 计数（本地估算器）
+- 视频模型（veo）上游匿名端点无可用操作，已在模型解析层显式拒绝（返回 400）
 
 FreeBuff 的其他动态模型也以 `FreeBuff/<短模型名>` 展示。例如 `mimo/mimo-v2.5` 会显示为 `FreeBuff/mimo-v2.5`。模型列表每 30 分钟从动态目录刷新一次；控制面只展示已启用上游可用的模型。
 

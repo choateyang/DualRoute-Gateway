@@ -404,8 +404,8 @@ func (d *dockerClient) createWithSpecNamed(cfg Config, containerName string, ins
 	labels["dualroute.gateway.cline_task_id"] = instance.ClineTaskID
 	labels["dualroute.gateway.upstream_key_id"] = instance.UpstreamKeyID
 	labels["dualroute.gateway.upstream_key_ids"] = strings.Join(instance.UpstreamKeyIDs, ",")
-	payload := map[string]any{"Image": original.Config.Image, "Env": environment, "Labels": labels, "ExposedPorts": original.Config.ExposedPorts,
-		"HostConfig": map[string]any{"NetworkMode": original.HostConfig.NetworkMode, "Binds": original.HostConfig.Binds, "ReadonlyRootfs": original.HostConfig.ReadonlyRootfs, "SecurityOpt": original.HostConfig.SecurityOpt, "Tmpfs": original.HostConfig.Tmpfs, "RestartPolicy": original.HostConfig.RestartPolicy}}
+	payload := map[string]any{"Image": cfg.GatewayImage, "Env": environment, "Labels": labels, "ExposedPorts": map[string]any{"13339/tcp": map[string]any{}},
+		"HostConfig": map[string]any{"NetworkMode": cfg.DockerNetwork, "Binds": []string{instanceDataVolume(containerName) + ":/data:rw"}, "ReadonlyRootfs": true, "SecurityOpt": []string{"no-new-privileges:true"}, "Tmpfs": map[string]string{"/tmp": "rw,noexec,nosuid,size=16m"}, "RestartPolicy": map[string]string{"Name": "unless-stopped"}}}
 	encoded, _ := json.Marshal(payload)
 	return d.request(http.MethodPost, "/v1.43/containers/create?name="+url.QueryEscape(containerName), strings.NewReader(string(encoded)), nil)
 }
@@ -547,7 +547,7 @@ func (s *Server) discoverInstances() ([]Instance, error) {
 			name = configured
 		}
 		instances = append(instances, Instance{
-			Name: name, Container: strings.TrimPrefix(first(container.Names), "/"), ContainerID: container.ID, Managed: true,
+			Name: name, Container: strings.TrimPrefix(first(container.Names), "/"), ContainerID: container.ID, ContainerImage: container.Image, Managed: true,
 			URL: "http://" + strings.TrimPrefix(first(container.Names), "/") + ":13339", Status: container.State,
 			ProxyURLs:      split(container.Labels["dualroute.gateway.proxy_urls"]),
 			MaxConcurrency: positiveInt(container.Labels["dualroute.gateway.max_concurrency"], 4),
@@ -573,12 +573,18 @@ func providerOrDefault(provider string) string {
 	if provider == ProviderFreeBuff {
 		return ProviderFreeBuff
 	}
+	if provider == ProviderVertex {
+		return ProviderVertex
+	}
 	return ProviderTokenRouter
 }
 
 func upstreamURLForProvider(provider string) string {
 	if providerOrDefault(provider) == ProviderOpenCode {
 		return openCodeAPIURL
+	}
+	if providerOrDefault(provider) == ProviderVertex {
+		return "internal://vertex"
 	}
 	if providerOrDefault(provider) == ProviderCline {
 		return clineAPIURL
@@ -596,6 +602,10 @@ func upstreamModelForProvider(provider string) string {
 	}
 	if providerOrDefault(provider) == ProviderCline {
 		// Cline selects the model in the client request; do not force an alias.
+		return ""
+	}
+	if providerOrDefault(provider) == ProviderVertex {
+		// Vertex forwards the client-selected Gemini model to vproxy.
 		return ""
 	}
 	if providerOrDefault(provider) == ProviderFreeBuff {

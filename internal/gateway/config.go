@@ -17,11 +17,13 @@ const (
 	ProviderOpenCode    = "opencode"
 	ProviderCline       = "cline"
 	ProviderFreeBuff    = "freebuff"
+	ProviderVertex      = "vertex"
 
 	tokenRouterURL         = "https://api.tokenrouter.com/v1"
 	openCodeZenURL         = "https://opencode.ai/zen"
 	clineAPIURL            = "https://api.cline.bot/api/v1"
 	freeBuffAPIURL         = "https://www.codebuff.com"
+	vertexProxyURL         = "internal://vertex"
 	tokenRouterModel       = "deepseek/deepseek-v4-pro-0813-free"
 	openCodeModel          = "deepseek-v4-flash-free"
 	tokenRouterClientModel = "TokenRouter/deepseek-v4-pro"
@@ -314,8 +316,15 @@ func applyProviderDefaults(c *Config) error {
 		c.FreeModelsOnly = false
 		c.DisableThinkingByDefault = false
 		c.MinThinkingMaxTokens = 0
+	case ProviderVertex:
+		// Google is called directly by forwardVertex; no HTTP upstream URL.
+		c.UpstreamURL = vertexProxyURL
+		c.ForcedModel = ""
+		c.FreeModelsOnly = false
+		c.DisableThinkingByDefault = false
+		c.MinThinkingMaxTokens = 0
 	default:
-		return fmt.Errorf("UPSTREAM_PROVIDER must be %q, %q, %q, or %q", ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff)
+		return fmt.Errorf("UPSTREAM_PROVIDER must be %q, %q, %q, %q, or %q", ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff, ProviderVertex)
 	}
 	return nil
 }

@@ -162,6 +162,10 @@ type Stats struct {
 type Gateway struct {
 	cfg                Config
 	client             *http.Client
+	// vertexExitRest 记录近期被上游 429 的出口及解禁时间（竞速跨请求记忆）。
+	vertexExitRest     sync.Map
+	// vertexExitHealth 记录各出口成功/失败计数，用于竞速候选排序（健康度学习）。
+	vertexExitHealth   sync.Map
 	slotsMu            sync.RWMutex
 	slots              []*proxySlot
 	base               []*proxySlot
@@ -1242,6 +1246,9 @@ func (g *Gateway) forward(ctx context.Context, w http.ResponseWriter, r *http.Re
 	if g.cfg.UpstreamProvider == ProviderFreeBuff {
 		return g.forwardFreeBuff(ctx, w, r, path, body, model, streaming)
 	}
+	if g.cfg.UpstreamProvider == ProviderVertex {
+		return g.forwardVertex(ctx, w, r, path, body, model, streaming)
+	}
 	baseResponseHeaders := w.Header().Clone()
 	target := upstreamTargetURL(g.cfg.UpstreamURL, path)
 	if r.URL.RawQuery != "" {
@@ -1644,6 +1651,12 @@ func stripClientModelAlias(provider, model string) string {
 	case ProviderFreeBuff:
 		if strings.HasPrefix(strings.ToLower(model), "freebuff/") {
 			return model[len("FreeBuff/"):]
+		}
+	case ProviderVertex:
+		// Generic prefix strip so Gemini models added to vproxy after this
+		// build resolve without a worker update.
+		if strings.HasPrefix(strings.ToLower(model), "vertex/") {
+			return strings.TrimSpace(model[len("vertex/"):])
 		}
 	}
 	return model

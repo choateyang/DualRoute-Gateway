@@ -2,6 +2,7 @@ package main
 
 import (
 	"dualroute-gateway/internal/controlplane"
+	"dualroute-gateway/internal/version"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -45,7 +46,7 @@ func main() {
 	errs := make(chan error, 2)
 	go func() { errs <- controlServer.ListenAndServe() }()
 	go func() { errs <- apiServer.ListenAndServe() }()
-	slog.Info("control plane listening", "addr", cfg.ListenAddr, "api_addr", cfg.APIListenAddr, "instances", len(cfg.Instances))
+	slog.Info("control plane listening", "version", version.Number(), "addr", cfg.ListenAddr, "api_addr", cfg.APIListenAddr, "instances", len(cfg.Instances))
 	if err := <-errs; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("control plane stopped", "error", err)
 		os.Exit(1)

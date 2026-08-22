@@ -140,6 +140,13 @@ label small { color: var(--muted); font-size: 11px; }
 .provider-group-head strong, .model-provider-head strong { font-size: 14px; }
 .provider-group-head small, .model-provider-head small { margin-top: 3px; color: var(--muted); font-size: 10px; }
 .provider-key-list, .model-list { display: grid; }
+.model-provider-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.model-collapse { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 30px; height: 30px; padding: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); cursor: pointer; transition: transform .15s, background .15s, border-color .15s; }
+.model-collapse:hover { background: var(--panel-soft); border-color: var(--muted); }
+.model-collapse .chevron { width: 0; height: 0; border-left: 5px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent; opacity: .6; transition: transform .15s ease; }
+.model-provider:not(.collapsed) .model-collapse .chevron { transform: rotate(90deg); }
+.model-provider.collapsed .model-list { display: none; }
+.model-provider.collapsed .model-provider-head { border-bottom-color: transparent; }
 .provider-key, .model-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; padding: 12px 14px; border-bottom: 1px solid var(--line); }
 .provider-key:last-child, .model-row:last-child { border-bottom: 0; }
 .provider-key > div, .model-row > div { min-width: 0; }

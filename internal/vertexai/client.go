@@ -1,0 +1,594 @@
+package vertexai
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"dualroute-gateway/internal/config"
+	"dualroute-gateway/internal/nodes"
+	"dualroute-gateway/internal/recaptcha"
+	"dualroute-gateway/internal/transform"
+	"dualroute-gateway/internal/transport"
+)
+
+const (
+	anonBaseURL      = "https://cloudconsole-pa.clients6.google.com"
+	batchGraphqlPath = "/v3/entityServices/AiplatformEntityService/schemas/AIPLATFORM_GRAPHQL:batchGraphql"
+	anonAPIKey       = "AIzaSyCI-zsRP85UVOi0DjtiCwWBwQ1djDy741g"
+)
+
+var batchGraphqlURL = anonBaseURL + batchGraphqlPath + "?key=" + anonAPIKey + "&prettyPrint=false" //nolint:gochecknoglobals
+
+var defaultSafetySettings = []any{ //nolint:gochecknoglobals
+	map[string]any{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+	map[string]any{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+	map[string]any{"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+	map[string]any{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+	map[string]any{"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+}
+
+// RequestIDKey 是 context 中存储 reqID 的键类型。
+type RequestIDKey struct{}
+
+// RequestIDFromContext 取请求上下文里的 request-id（无则空串）。
+func RequestIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(RequestIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+type VertexAIClient struct {
+	net  *transport.NetworkClient
+	pool *recaptcha.TokenPool
+	cfg  config.ConfigProvider
+}
+
+type requestRouteKey struct{}
+
+type requestTokenState struct {
+	mu           sync.Mutex
+	token        string
+	proxyURI     string
+	fetchToken   func(context.Context) (string, error)
+	refreshing   bool
+	wait         chan struct{}
+	lastErr      error
+	refreshes    int
+	refreshLimit int
+	limitSet     bool
+}
+
+type tokenInvalidationResult struct {
+	refreshed bool
+	exhausted bool
+}
+
+type requestRoute struct {
+	entryURI           string
+	token              *requestTokenState
+	authCandidateBound bool
+}
+
+func routeFromContext(ctx context.Context) *requestRoute {
+	route, _ := ctx.Value(requestRouteKey{}).(*requestRoute)
+	return route
+}
+
+func (s *requestTokenState) get(ctx context.Context, pool *recaptcha.TokenPool) (string, error) {
+	for {
+		s.mu.Lock()
+		if s.token != "" {
+			token := s.token
+			s.mu.Unlock()
+			return token, nil
+		}
+		if s.refreshing {
+			wait := s.wait
+			s.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-wait:
+				s.mu.Lock()
+				token, err := s.token, s.lastErr
+				s.mu.Unlock()
+				return token, err
+			}
+		}
+		if s.lastErr != nil {
+			err := s.lastErr
+			s.mu.Unlock()
+			return "", err
+		}
+		s.refreshing = true
+		s.wait = make(chan struct{})
+		wait := s.wait
+		proxyURI := s.proxyURI
+		fetchToken := s.fetchToken
+		s.mu.Unlock()
+
+		var token string
+		var err error
+		if fetchToken != nil {
+			token, err = fetchToken(ctx)
+		} else {
+			token, err = pool.GetTokenWithProxyContext(ctx, proxyURI)
+		}
+		if err == nil && token == "" {
+			err = fmt.Errorf("empty recaptcha token")
+		}
+		s.mu.Lock()
+		if err == nil {
+			s.token = token
+		}
+		s.lastErr = err
+		s.refreshing = false
+		close(wait)
+		s.mu.Unlock()
+		return token, err
+	}
+}
+
+func (s *requestTokenState) setRefreshLimit(limit int) {
+	if limit < 0 {
+		limit = 0
+	}
+	s.mu.Lock()
+	s.refreshLimit = limit
+	s.limitSet = true
+	s.mu.Unlock()
+}
+
+func (s *requestTokenState) setProxyURI(proxyURI string) {
+	s.mu.Lock()
+	s.proxyURI = proxyURI
+	s.token = ""
+	s.lastErr = nil
+	s.refreshes = 0
+	s.mu.Unlock()
+}
+
+func (s *requestTokenState) invalidateToken(token string) tokenInvalidationResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.token != token {
+		return tokenInvalidationResult{}
+	}
+	limit := s.refreshLimit
+	if !s.limitSet {
+		// Preserve the standalone state helper's historical one-refresh default;
+		// request paths always set an explicit policy during prepareRequest.
+		limit = 1
+	}
+	if s.refreshes >= limit {
+		return tokenInvalidationResult{exhausted: true}
+	}
+	s.token = ""
+	s.lastErr = nil
+	s.refreshes++
+	return tokenInvalidationResult{refreshed: true}
+}
+
+// invalidate clears the current token. A stale lease is treated as already handled.
+func (s *requestTokenState) invalidate(token string) bool {
+	result := s.invalidateToken(token)
+	return !result.exhausted
+}
+
+func (c *VertexAIClient) prepareRequest(ctx context.Context) (context.Context, error) {
+	ctx = transport.WithRequestID(ctx, RequestIDFromContext(ctx))
+	state := &requestTokenState{fetchToken: c.fetchRequestToken} //nolint:exhaustruct
+	authCandidateBound := c.cfg.ParallelPoolEnabled() && !c.cfg.ParallelPoolRetryEnabled()
+	refreshLimit := c.cfg.MaxRetries()
+	if authCandidateBound {
+		// RunRace replaces this provisional value with the actual number of
+		// candidates selected for the request. The initial token is the first try.
+		refreshLimit = max(0, requestConcurrency(c.cfg)-1)
+	}
+	state.setRefreshLimit(refreshLimit)
+	token, err := state.get(ctx, c.pool)
+	if err != nil || token == "" {
+		if err == nil {
+			err = fmt.Errorf("empty recaptcha token")
+		}
+		return ctx, err
+	}
+	route := &requestRoute{token: state, authCandidateBound: authCandidateBound}
+	modelEntries := config.SelectEntryProxySequence(requestConcurrency(c.cfg), c.cfg)
+	return transport.WithEntryProxyPool(context.WithValue(ctx, requestRouteKey{}, route), modelEntries), nil
+}
+
+func requestConcurrency(cfg config.ConfigProvider) int {
+	if cfg == nil || !cfg.ParallelPoolEnabled() {
+		return 1
+	}
+	if size := cfg.ParallelPoolSize(); size > 0 {
+		return size
+	}
+	return 1
+}
+
+type tokenAttempt struct {
+	route string
+	token string
+	err   error
+	entry bool
+}
+
+func (c *VertexAIClient) fetchRequestToken(ctx context.Context) (string, error) {
+	attempts := requestConcurrency(c.cfg)
+	entries := config.SelectEntryProxySequence(attempts, c.cfg)
+	if len(entries) > 0 {
+		if token, err := c.raceTokenAttempts(ctx, entries, true); err == nil {
+			return token, nil
+		} else if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+	}
+
+	var routes []string
+	if candidates := nodes.SelectForParallel(attempts, c.cfg.ParallelNodeTopK(), c.cfg.DebugMode(), false); len(candidates) > 0 {
+		routes = make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			routes = append(routes, candidate.RawURI)
+		}
+	}
+	if len(routes) == 0 {
+		routes = []string{""}
+	}
+	return c.raceTokenAttempts(ctx, routes, false)
+}
+
+func (c *VertexAIClient) raceTokenAttempts(ctx context.Context, routes []string, entry bool) (string, error) {
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan tokenAttempt, len(routes))
+	for _, route := range routes {
+		route := route
+		go func() {
+			token, err := c.pool.GetTokenWithProxyContext(raceCtx, route)
+			if err == nil && token == "" {
+				err = fmt.Errorf("empty recaptcha token")
+			}
+			results <- tokenAttempt{route: route, token: token, err: err, entry: entry}
+		}()
+	}
+
+	var firstErr error
+	var winner string
+	gotWinner := false
+	failedEntries := make(map[string]string)
+	for range routes {
+		result := <-results
+		if result.err == nil && !gotWinner {
+			winner = result.token
+			gotWinner = true
+			cancel()
+			if result.entry {
+				_ = config.MarkEntryProxySuccess(result.route)
+			} else if result.route != "" {
+				nodes.RecordTest(result.route, true, 0, "")
+			}
+			continue
+		}
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			if ctx.Err() != nil || gotWinner && errors.Is(result.err, context.Canceled) {
+				continue
+			}
+			if result.entry {
+				if _, exists := failedEntries[result.route]; !exists {
+					failedEntries[result.route] = result.err.Error()
+				}
+			} else if result.route != "" {
+				nodes.RecordTest(result.route, false, 0, result.err.Error())
+			}
+		}
+	}
+	for route, errText := range failedEntries {
+		_ = config.MarkEntryProxyFailure(route, errText)
+	}
+	if gotWinner {
+		return winner, nil
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("all recaptcha token routes failed")
+	}
+	return "", firstErr
+}
+
+func NewVertexAIClient(cfg config.ConfigProvider) *VertexAIClient {
+	net := transport.NewNetworkClient(cfg.DebugMode(), cfg.ProxyURL)
+	return &VertexAIClient{
+		net:  net,
+		pool: recaptcha.NewTokenPool(net, cfg.ProxyURL, cfg.DebugMode()),
+		cfg:  cfg,
+	}
+}
+
+func (c *VertexAIClient) getBatchGraphqlURL() string {
+	if !strings.HasPrefix(batchGraphqlURL, anonBaseURL) {
+		return batchGraphqlURL
+	}
+	key := c.cfg.VertexAPIKey()
+	if key == "" {
+		key = anonAPIKey
+	}
+	return anonBaseURL + batchGraphqlPath + "?key=" + key + "&prettyPrint=false"
+}
+
+
+type candidateCollector struct {
+	index             int
+	parts             []map[string]any
+	finishReason      string
+	finishMessage     any
+	safetyRatings     any
+	citationMetadata  any
+	groundingMetadata any
+	tokenCount        any
+	avgLogprobs       any
+	logprobsResult    any
+}
+
+func (c *VertexAIClient) buildCompleteResponse(r *ParseResult) (map[string]any, error) {
+	if r.HasError {
+		return nil, NewInternalError("upstream parse error: " + r.ErrorMessage)
+	}
+
+	resp := map[string]any{}
+	switch {
+	case len(r.Candidates) > 0:
+		resp["candidates"] = toAnySlice(r.Candidates)
+	case len(r.Parts) > 0:
+		resp["candidates"] = []any{buildCandidate(r.CandidateIndex, r.Parts, r)}
+	case len(r.PromptFeedback) > 0:
+		resp["candidates"] = []any{buildCandidate(r.CandidateIndex, []map[string]any{{"text": " "}}, r)}
+	default:
+		return nil, NewEmptyResponseError("Upstream returned empty response (no content)")
+	}
+
+	setIfPresent(resp, "createTime", r.CreateTime)
+	setIfPresent(resp, "modelVersion", r.ModelVersion)
+	if len(r.PromptFeedback) > 0 {
+		resp["promptFeedback"] = r.PromptFeedback
+	}
+	setIfPresent(resp, "responseId", r.ResponseID)
+	if len(r.UsageMetadata) > 0 {
+		resp["usageMetadata"] = r.UsageMetadata
+	}
+	setIfPresent(resp, "modelStatus", r.ModelStatus)
+	return resp, nil
+}
+
+func buildCandidate(index int, parts []map[string]any, r *ParseResult) map[string]any {
+	candidate := map[string]any{
+		"index":   index,
+		"content": map[string]any{"parts": toAnySlice(parts), "role": "model"},
+	}
+	if r.FinishReason != "" {
+		candidate["finishReason"] = strings.ToUpper(r.FinishReason)
+	}
+	setIfPresent(candidate, "finishMessage", r.FinishMessage)
+	setIfPresent(candidate, "safetyRatings", r.SafetyRatings)
+	setIfPresent(candidate, "citationMetadata", r.CitationMetadata)
+	setIfPresent(candidate, "groundingMetadata", r.GroundingMetadata)
+	setIfPresent(candidate, "tokenCount", r.TokenCount)
+	setIfPresent(candidate, "avgLogprobs", r.AvgLogprobs)
+	setIfPresent(candidate, "logprobsResult", r.LogprobsResult)
+	return candidate
+}
+
+// collectChunksToParseResult 按 candidate index 独立合并流式 parts，并保留所有候选。
+func collectChunksToParseResult(chunks []map[string]any) *ParseResult {
+	s := &ParseResult{
+		PromptFeedback: map[string]any{},
+		UsageMetadata:  map[string]any{},
+	}
+	candidatesMap := map[int]*candidateCollector{}
+
+	for _, chunk := range chunks {
+		if candidates, ok := chunk["candidates"].([]any); ok {
+			for position, rawCandidate := range candidates {
+				candidate, ok := rawCandidate.(map[string]any)
+				if !ok {
+					continue
+				}
+				index := position
+				if candidate["index"] != nil {
+					index = toInt(candidate["index"], position)
+				}
+				collector, exists := candidatesMap[index]
+				if !exists {
+					collector = &candidateCollector{index: index} //nolint:exhaustruct
+					candidatesMap[index] = collector
+				}
+
+				if value := candidate["finishReason"]; isTruthyAny(value) {
+					collector.finishReason = toStr(value)
+				}
+				if value, exists := candidate["finishMessage"]; exists {
+					collector.finishMessage = value
+				}
+				if value := candidate["safetyRatings"]; isTruthyAny(value) {
+					collector.safetyRatings = value
+				}
+				if value := candidate["citationMetadata"]; isTruthyAny(value) {
+					collector.citationMetadata = value
+				}
+				if value := candidate["groundingMetadata"]; isTruthyAny(value) {
+					collector.groundingMetadata = value
+				}
+				if value, exists := candidate["tokenCount"]; exists {
+					collector.tokenCount = value
+				}
+				if value, exists := candidate["avgLogprobs"]; exists {
+					collector.avgLogprobs = value
+				}
+				if value, exists := candidate["logprobsResult"]; exists {
+					collector.logprobsResult = value
+				}
+				if content, ok := candidate["content"].(map[string]any); ok {
+					if parts, ok := content["parts"].([]any); ok {
+						for _, rawPart := range parts {
+							if part, ok := rawPart.(map[string]any); ok {
+								collector.parts = append(collector.parts, part)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if feedback, ok := chunk["promptFeedback"].(map[string]any); ok && len(feedback) > 0 && len(s.PromptFeedback) == 0 {
+			s.PromptFeedback = feedback
+		}
+		if usage, ok := chunk["usageMetadata"]; ok {
+			if usageMap := toMap(usage); len(usageMap) > 0 {
+				s.UsageMetadata = usageMap
+			}
+		}
+		if value, ok := chunk["createTime"]; ok {
+			s.CreateTime = value
+		}
+		if value, ok := chunk["modelVersion"]; ok {
+			s.ModelVersion = value
+		}
+		if value, ok := chunk["responseId"]; ok {
+			s.ResponseID = value
+		}
+	}
+
+	indices := make([]int, 0, len(candidatesMap))
+	for index := range candidatesMap {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		collector := candidatesMap[index]
+		parts := transform.MergeContentBlocks(collector.parts)
+		candidate := map[string]any{
+			"index":   index,
+			"content": map[string]any{"parts": toAnySlice(parts), "role": "model"},
+		}
+		if collector.finishReason != "" {
+			candidate["finishReason"] = strings.ToUpper(collector.finishReason)
+		}
+		setIfPresent(candidate, "finishMessage", collector.finishMessage)
+		setIfPresent(candidate, "safetyRatings", collector.safetyRatings)
+		setIfPresent(candidate, "citationMetadata", collector.citationMetadata)
+		setIfPresent(candidate, "groundingMetadata", collector.groundingMetadata)
+		setIfPresent(candidate, "tokenCount", collector.tokenCount)
+		setIfPresent(candidate, "avgLogprobs", collector.avgLogprobs)
+		setIfPresent(candidate, "logprobsResult", collector.logprobsResult)
+		s.Candidates = append(s.Candidates, candidate)
+	}
+
+	if len(indices) > 0 {
+		first := candidatesMap[indices[0]]
+		s.Parts = transform.MergeContentBlocks(first.parts)
+		s.FinishReason = first.finishReason
+		s.FinishMessage = first.finishMessage
+		s.SafetyRatings = first.safetyRatings
+		s.CitationMetadata = first.citationMetadata
+		s.GroundingMetadata = first.groundingMetadata
+		s.TokenCount = first.tokenCount
+		s.AvgLogprobs = first.avgLogprobs
+		s.LogprobsResult = first.logprobsResult
+		s.CandidateIndex = first.index
+	}
+	return s
+}
+
+func candidateFinish(result map[string]any) string {
+	if cands, ok := result["candidates"].([]any); ok && len(cands) > 0 {
+		if c, ok := cands[0].(map[string]any); ok {
+			return toStr(c["finishReason"])
+		}
+	}
+	return ""
+}
+
+func shallowCopy(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func deepCopyAny(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = deepCopyAny(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = deepCopyAny(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func asVertexError(err error) *VertexError {
+	var ve *VertexError
+	if errors.As(err, &ve) {
+		return ve
+	}
+	return nil
+}
+
+func setIfPresent(m map[string]any, key string, v any) {
+	if v == nil {
+		return
+	}
+	switch x := v.(type) {
+	case string:
+		if x == "" {
+			return
+		}
+	case []any:
+		if len(x) == 0 {
+			return
+		}
+	case map[string]any:
+		if len(x) == 0 {
+			return
+		}
+	}
+	m[key] = v
+}
+
+func backoff(attempt int) time.Duration {
+	v := math.Pow(1.5, float64(attempt))
+	if v > 15 {
+		v = 15
+	}
+	return time.Duration(v * float64(time.Second))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err() //nolint:wrapcheck
+	case <-t.C:
+		return nil
+	}
+}

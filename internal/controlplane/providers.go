@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -70,9 +71,79 @@ func defaultModelSettings() ModelSettings {
 	return ModelSettings{DisabledProviders: make(map[string]bool), DisabledModels: make(map[string]map[string]bool)}
 }
 
+// vertexVideoPattern blocks video models (veo*) at resolution time: the
+// anonymous endpoint exposes no usable operation for them.
+var vertexVideoPattern = regexp.MustCompile(`(?i)^veo(-|$)`)
+
+// 实测（2026-08-22 直连上游）：OpenCode 免费档中仅 mimo-v2.5-free 响应
+// reasoning_effort（none=0 token / low=79 / high=180）；x-preview-f-free 忽略
+// 该参数、muse-spark 非思考模型，均不下发思考元数据。
+var openCodeReasoningTiers = map[string][]string{
+	"mimo-v2.5-free": {"none", "low", "high"},
+}
+
+var vertexDefaultReasoningTiers = []string{"none", "minimal", "low", "medium", "high"}
+
+// Pro 系列不支持关闭思考（无 NONE 档）。
+var vertexModelReasoningTiers = map[string][]string{
+	"gemini-2.5-pro":         {"low", "medium", "high"},
+	"gemini-3.1-pro-preview": {"low", "medium", "high"},
+}
+
+func vertexReasoningTiersFor(model string) []string {
+	if tiers, ok := vertexModelReasoningTiers[model]; ok {
+		return tiers
+	}
+	return vertexDefaultReasoningTiers
+}
+
+func vertexNonChatModel(model string) bool {
+	return strings.HasPrefix(model, "imagen") || strings.HasPrefix(model, "veo") ||
+		strings.Contains(model, "-image") || strings.Contains(model, "-tts") ||
+		strings.HasPrefix(model, "virtual-try-on")
+}
+
+func reasoningEffortMeta(tiers []string) []map[string]any {
+	meta := make([]map[string]any, 0, len(tiers))
+	for i, tier := range tiers {
+		label := strings.ToUpper(tier[:1]) + tier[1:]
+		entry := map[string]any{"value": tier, "label": label}
+		if i == 0 {
+			entry["default"] = true
+		}
+		meta = append(meta, entry)
+	}
+	return meta
+}
+
+// vertexModels mirrors the Gemini models of the default vproxy registry that
+// dualroute can serve: chat plus image generation and TTS. Video (veo) is
+// absent because the upstream anonymous endpoint exposes no usable operation.
+var vertexModels = []string{
+	"gemini-2.5-flash",
+	"gemini-2.5-flash-lite",
+	"gemini-2.5-pro",
+	"gemini-3-flash-preview",
+	"gemini-3.1-flash-lite",
+	"gemini-3.1-pro-preview",
+	"gemini-3.5-flash",
+	"gemini-3.5-flash-lite",
+	"gemini-3.6-flash",
+	"gemini-3.7-flash",
+	// Image generation (served via /v1/images/*).
+	"gemini-2.5-flash-image",
+	"gemini-3-pro-image",
+	"imagen-4.0-fast-generate-001",
+	"imagen-4.0-generate-001",
+	"imagen-4.0-ultra-generate-001",
+	"virtual-try-on-001",
+	// Text-to-speech (served via /v1/audio/speech).
+	"gemini-3.1-flash-tts-preview",
+}
+
 func validProvider(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff:
+	case ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff, ProviderVertex:
 		return true
 	default:
 		return false
@@ -89,6 +160,8 @@ func providerDisplayName(provider string) string {
 		return "Cline"
 	case ProviderFreeBuff:
 		return "FreeBuff"
+	case ProviderVertex:
+		return "Vertex"
 	default:
 		return provider
 	}
@@ -111,6 +184,8 @@ func clientModelFor(provider, model string) string {
 			model = model[index+1:]
 		}
 		return freeBuffClientPrefix + model
+	case ProviderVertex:
+		return "Vertex/" + strings.TrimSpace(model)
 	default:
 		return model
 	}
@@ -370,6 +445,7 @@ func (s *Server) modelCatalog() []providerCatalog {
 		ProviderOpenCode:    s.openCodeModelList(),
 		ProviderCline:       {clineUpstreamModel},
 		ProviderFreeBuff:    nil,
+		ProviderVertex:      append([]string(nil), vertexModels...),
 	}
 	s.providerModelsMu.RLock()
 	models[ProviderFreeBuff] = append([]string(nil), s.freeBuffModels...)
@@ -381,7 +457,7 @@ func (s *Server) modelCatalog() []providerCatalog {
 		}
 	}
 	s.clineModelsMu.RUnlock()
-	order := []string{ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff}
+	order := []string{ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff, ProviderVertex}
 	catalog := make([]providerCatalog, 0, len(order))
 	for _, provider := range order {
 		seen := make(map[string]struct{})
@@ -483,12 +559,24 @@ func (s *Server) providerModelFromClient(provider, model string) (string, bool) 
 		if strings.HasPrefix(strings.ToLower(model), "freebuff/") {
 			return strings.TrimSpace(model[len("FreeBuff/"):]), true
 		}
+	case ProviderVertex:
+		// Prefixed form only: bare names must keep failing resolution so
+		// typos surface as "unknown model" instead of silently hitting Vertex.
+		if strings.HasPrefix(strings.ToLower(model), "vertex/") {
+			candidate := strings.TrimSpace(model[len("vertex/"):])
+			if vertexVideoPattern.MatchString(candidate) {
+				// Video models have no usable anonymous operation.
+				return model, false
+			}
+			return candidate, true
+		}
+		return model, false
 	}
 	return model, false
 }
 
 func (s *Server) providerFromClientModel(model string) (string, string, bool) {
-	for _, provider := range []string{ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff} {
+	for _, provider := range []string{ProviderTokenRouter, ProviderOpenCode, ProviderCline, ProviderFreeBuff, ProviderVertex} {
 		if upstream, ok := s.providerModelFromClient(provider, model); ok {
 			return provider, upstream, true
 		}

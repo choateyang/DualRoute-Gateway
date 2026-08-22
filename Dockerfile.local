@@ -1,13 +1,17 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.24-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum VERSION ./
+RUN go mod download && mkdir -p internal/version && cp VERSION internal/version/VERSION.txt
 COPY cmd ./cmd
 COPY internal ./internal
+# /data owned by the runtime UID (65532) so named volumes start writable.
+RUN mkdir -p /data && chown 65532:65532 /data
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/dualroute-gateway ./cmd/gateway && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/edgetunnel-config ./cmd/edgetunnel-config && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/control-plane ./cmd/control-plane
 
 FROM scratch
+COPY --from=build --chown=65532:65532 /data /data
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/dualroute-gateway /dualroute-gateway
 COPY --from=build /out/edgetunnel-config /edgetunnel-config

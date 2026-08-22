@@ -24,6 +24,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+
+	"dualroute-gateway/internal/version"
 )
 
 //go:embed web/index.html web/app.js web/style.css web/pages/*.html
@@ -34,6 +36,7 @@ const (
 	ProviderOpenCode    = "opencode"
 	ProviderCline       = "cline"
 	ProviderFreeBuff    = "freebuff"
+	ProviderVertex      = "vertex"
 
 	defaultUpstreamURL     = "https://api.tokenrouter.com/v1"
 	openCodeAPIURL         = "https://opencode.ai/zen"
@@ -105,6 +108,7 @@ type Instance struct {
 	URL            string   `json:"url"`
 	Container      string   `json:"container"`
 	ContainerID    string   `json:"container_id,omitempty"`
+	ContainerImage string   `json:"container_image,omitempty"`
 	Managed        bool     `json:"managed"`
 	Status         string   `json:"status"`
 	ProxyURLs      []string `json:"proxy_urls,omitempty"`
@@ -450,6 +454,29 @@ func isModelsRequest(path string) bool {
 	return path == "/v1/models" || path == "/openai/v1/models"
 }
 
+// mediaModelHint extracts a model identifier for endpoints that keep it out of
+// the JSON body: multipart image uploads carry it as a form field, native
+// Gemini action paths embed it (/v1beta/models/<model>:countTokens).
+func mediaModelHint(r *http.Request, body []byte) string {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		if err := r.ParseMultipartForm(32 << 20); err == nil && r.MultipartForm != nil {
+			if value := strings.TrimSpace(r.FormValue("model")); value != "" {
+				return value
+			}
+		}
+		// Restore the pristine body so the proxy forwards the original bytes.
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return ""
+	}
+	if idx := strings.Index(r.URL.Path, "/models/"); idx >= 0 {
+		tail := r.URL.Path[idx+len("/models/"):]
+		if action := strings.Index(tail, ":"); action > 0 {
+			return tail[:action]
+		}
+	}
+	return ""
+}
+
 func (s *Server) requestedProvider(r *http.Request) (string, bool, error) {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return "", false, nil
@@ -467,13 +494,21 @@ func (s *Server) requestedProvider(r *http.Request) (string, bool, error) {
 		Model string `json:"model"`
 	}
 	if len(body) == 0 || json.Unmarshal(body, &request) != nil || strings.TrimSpace(request.Model) == "" {
-		if isClineClientType(r.Header.Get("X-CLIENT-TYPE")) {
-			if !s.providerEnabled(ProviderCline) {
-				return "", false, fmt.Errorf("provider %q is disabled", ProviderCline)
-			}
-			return ProviderCline, true, nil
+		// Media endpoints carry the model outside the JSON body: multipart
+		// image uploads use a form field, native Gemini actions put it in the
+		// path (/v1beta/models/<model>:countTokens).
+		if request.Model == "" {
+			request.Model = mediaModelHint(r, body)
 		}
-		return "", false, nil
+		if strings.TrimSpace(request.Model) == "" {
+			if isClineClientType(r.Header.Get("X-CLIENT-TYPE")) {
+				if !s.providerEnabled(ProviderCline) {
+					return "", false, fmt.Errorf("provider %q is disabled", ProviderCline)
+				}
+				return ProviderCline, true, nil
+			}
+			return "", false, nil
+		}
 	}
 	if isClineClientType(r.Header.Get("X-CLIENT-TYPE")) {
 		if !s.registerClineModel(request.Model) {
@@ -599,9 +634,19 @@ func (s *Server) models(w http.ResponseWriter, instances []Instance) {
 			model := map[string]any{"id": catalogModel.ClientModel, "object": "model", "owned_by": group.ID}
 			if group.ID == ProviderOpenCode {
 				model["contextWindow"] = 1000000
-				model["supportsReasoningEffort"] = true
-				model["reasoningEffort"] = "none"
-				model["reasoningEfforts"] = []map[string]any{{"value": "none", "label": "None", "default": true}, {"value": "low", "label": "Low"}, {"value": "medium", "label": "Medium"}, {"value": "high", "label": "High"}}
+				if tiers := openCodeReasoningTiers[catalogModel.ID]; len(tiers) > 0 {
+					model["supportsReasoningEffort"] = true
+					model["reasoningEffort"] = tiers[0]
+					model["reasoningEfforts"] = reasoningEffortMeta(tiers)
+				}
+			} else if group.ID == ProviderVertex {
+				model["contextWindow"] = 1048576
+				if !vertexNonChatModel(catalogModel.ID) {
+					tiers := vertexReasoningTiersFor(catalogModel.ID)
+					model["supportsReasoningEffort"] = true
+					model["reasoningEffort"] = tiers[0]
+					model["reasoningEfforts"] = reasoningEffortMeta(tiers)
+				}
 			} else if group.ID == ProviderCline {
 				model["contextWindow"] = 131072
 				model["maxTokens"] = 4096
@@ -864,6 +909,9 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 	case path == "/auth/status" && r.Method == http.MethodGet:
 		s.authStatus(w, r)
 		return
+	case path == "/version" && r.Method == http.MethodGet:
+		writeJSON(w, 200, map[string]any{"control_plane": version.Number(), "gateway_image": s.cfg.GatewayImage})
+		return
 	case path == "/auth/login" && r.Method == http.MethodPost:
 		s.login(w, r)
 		return
@@ -949,7 +997,7 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid_body"}`, http.StatusBadRequest)
 		return
 	}
-	if code, message := validateInstanceRequest(&request, true); code != 0 {
+	if code, message := s.validateInstanceRequest(&request, true); code != 0 {
 		http.Error(w, message, code)
 		return
 	}
@@ -979,7 +1027,7 @@ func (s *Server) instanceCreate(w http.ResponseWriter, r *http.Request) {
 	if request.Provider == ProviderCline {
 		request.ClineTaskID = newUUID()
 	}
-	if request.Provider == ProviderOpenCode {
+	if request.Provider == ProviderOpenCode || request.Provider == ProviderVertex {
 		request.AuthMode = providerAuthModePublic
 		request.UpstreamAPIKey = providerAuthModePublic
 		request.UpstreamKeyID = ""
@@ -1124,11 +1172,11 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 	if request.AuthMode == providerAuthModeCustom && strings.TrimSpace(request.UpstreamAPIKey) == "" && currentKey != "" && currentKey != providerAuthModePublic {
 		request.UpstreamAPIKey = currentKey
 	}
-	if code, message := validateInstanceRequest(&request, false); code != 0 {
+	if code, message := s.validateInstanceRequest(&request, false); code != 0 {
 		http.Error(w, message, code)
 		return
 	}
-	if request.Provider == ProviderOpenCode {
+	if request.Provider == ProviderOpenCode || request.Provider == ProviderVertex {
 		request.AuthMode = providerAuthModePublic
 		request.UpstreamAPIKey = providerAuthModePublic
 		request.UpstreamKeyID = ""
@@ -1209,17 +1257,22 @@ func (s *Server) instanceUpdate(w http.ResponseWriter, r *http.Request, name str
 	writeJSON(w, http.StatusOK, map[string]any{"instance": instance})
 }
 
-func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int, string) {
+func (s *Server) validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int, string) {
 	request.Provider = strings.ToLower(strings.TrimSpace(request.Provider))
 	if request.Provider == "" {
 		request.Provider = ProviderTokenRouter
 	}
-	if request.Provider != ProviderTokenRouter && request.Provider != ProviderOpenCode && request.Provider != ProviderCline && request.Provider != ProviderFreeBuff {
+	if request.Provider != ProviderTokenRouter && request.Provider != ProviderOpenCode && request.Provider != ProviderCline && request.Provider != ProviderFreeBuff && request.Provider != ProviderVertex {
 		return http.StatusBadRequest, `{"error":"invalid_provider"}`
 	}
 	request.AuthMode = strings.ToLower(strings.TrimSpace(request.AuthMode))
 	request.UpstreamAPIKey = strings.TrimSpace(request.UpstreamAPIKey)
 	if request.Provider == ProviderOpenCode {
+		request.AuthMode = providerAuthModePublic
+		request.UpstreamAPIKey = providerAuthModePublic
+	} else if request.Provider == ProviderVertex {
+		// Vertex calls Google anonymously from the worker itself; no upstream
+		// credentials exist for this provider.
 		request.AuthMode = providerAuthModePublic
 		request.UpstreamAPIKey = providerAuthModePublic
 	} else if request.AuthMode == "" {
@@ -1233,7 +1286,7 @@ func validateInstanceRequest(request *instanceRequest, defaultLimits bool) (int,
 		return http.StatusBadRequest, `{"error":"invalid_auth_mode"}`
 	}
 	if request.AuthMode == providerAuthModePublic {
-		if request.Provider != ProviderOpenCode {
+		if request.Provider != ProviderOpenCode && request.Provider != ProviderVertex {
 			return http.StatusBadRequest, `{"error":"public_auth_not_supported"}`
 		}
 		request.UpstreamAPIKey = providerAuthModePublic
@@ -1281,6 +1334,10 @@ func proxyURLOwner(instances []Instance, currentName, provider string, proxyURLs
 		return ""
 	}
 	provider = providerOrDefault(provider)
+	if provider == ProviderVertex {
+		// 每个 Vertex 实例都竞速使用全部出口，允许实例间重叠。
+		return ""
+	}
 	for _, instance := range instances {
 		if instance.Name == currentName || providerOrDefault(instance.Provider) != provider {
 			continue
